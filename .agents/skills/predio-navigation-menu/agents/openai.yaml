@@ -1,0 +1,4 @@
+interface:
+  display_name: "Menú de navegación predial"
+  short_description: "Modifica la navegación lateral y del mapa"
+  default_prompt: "Usa $predio-navigation-menu para actualizar el menú de navegación de predios."
