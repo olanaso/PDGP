@@ -1,6 +1,6 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useMemo, useRef, useState, type ReactNode } from "react";
 import { createFileRoute } from "@tanstack/react-router";
-import { Pencil, Plus, Save, Search, Send, Trash2, X } from "lucide-react";
+import { FileText, Loader2, Pencil, Plus, Save, Search, Send, Trash2, Upload, X } from "lucide-react";
 
 import { ProjectPageHeader } from "@/components/ProjectPageHeader";
 import { getPredioByCodigo } from "@/lib/prediosData";
@@ -336,14 +336,53 @@ function TitularDialog ({ onClose, onAdd }: { onClose: () => void; onAdd: (titul
     estadoCivil: "SOLTERO",
     documentoSustento: "DOCUMENTOS CON FECHA CIERTA",
   });
+  const [reniecLoading, setReniecLoading] = useState(false);
+  const [reniecFileName, setReniecFileName] = useState("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   function setTitularField<K extends keyof TitularForm> (key: K, value: TitularForm[K]) {
     setTitular((current) => ({ ...current, [key]: value }));
   }
 
+  function handleReniecUpload (event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setReniecFileName(file.name);
+    setReniecLoading(true);
+
+    // Simulate PDF data extraction with a delay
+    setTimeout(() => {
+      setTitular((current) => ({
+        ...current,
+        documento: "70021899",
+        nombres: "ERICK SIMON ESCALANTE OLANO",
+        fechaCaducidadDni: "2030-12-15",
+        departamento: "PIURA",
+        provincia: "PIURA",
+        distrito: "CASTILLA",
+        direccion: "AV. PROGRESO 234, URB. MIRAFLORES",
+        telefonos: "978868159",
+        estadoCivil: "SOLTERO",
+      }));
+      setReniecLoading(false);
+    }, 2000);
+
+    // Reset the input so the same file can be re-selected
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
   return (
     <div className="fixed inset-0 z-[10000] flex items-center justify-center bg-black/40 px-4" onClick={onClose}>
-      <div className="max-h-[90vh] w-[462px] overflow-auto rounded-lg bg-white p-5 shadow-xl" onClick={(event) => event.stopPropagation()}>
+      <div className="relative max-h-[90vh] w-[462px] overflow-auto rounded-lg bg-white p-5 shadow-xl" onClick={(event) => event.stopPropagation()}>
+        {/* RENIEC processing overlay */}
+        {reniecLoading && (
+          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center rounded-lg bg-white/90">
+            <Loader2 size={36} className="animate-spin text-red-600" />
+            <p className="mt-3 text-[13px] font-semibold text-gray-700">Procesando ficha RENIEC...</p>
+            <p className="mt-1 text-[11px] text-gray-500">Extrayendo datos del documento PDF</p>
+          </div>
+        )}
+
         <div className="mb-4 flex items-center justify-between">
           <div className="text-[14px]">
             <span className="text-gray-700">Agregar </span>
@@ -364,7 +403,22 @@ function TitularDialog ({ onClose, onAdd }: { onClose: () => void; onAdd: (titul
           <Field label="DNI" required>
             <div className="space-y-1">
               <input className={inputCls} value={titular.documento} onChange={(event) => setTitularField("documento", event.target.value)} />
-              <div className="grid grid-cols-2 gap-1">
+              <div className="grid grid-cols-3 gap-1">
+                {/* Hidden file input for RENIEC PDF upload */}
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".pdf"
+                  className="hidden"
+                  onChange={handleReniecUpload}
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="inline-flex min-h-8 items-center justify-center gap-1 rounded border border-red-200 bg-red-50 px-2 text-center text-[10px] font-medium text-red-700 hover:bg-red-100 transition-colors"
+                >
+                  <Upload size={13} /> Subir ficha RENIEC
+                </button>
                 <button type="button" className="inline-flex min-h-8 items-center justify-center gap-1.5 rounded border border-gray-200 bg-gray-50 px-2 text-center text-[11px] hover:bg-gray-100">
                   <Search size={13} /> Validacion ficha RENIEC
                 </button>
@@ -372,6 +426,13 @@ function TitularDialog ({ onClose, onAdd }: { onClose: () => void; onAdd: (titul
                   <Search size={13} /> Buscar DNI
                 </button>
               </div>
+              {reniecFileName && (
+                <div className="flex items-center gap-1.5 rounded border border-green-200 bg-green-50 px-2 py-1">
+                  <FileText size={13} className="shrink-0 text-green-600" />
+                  <span className="truncate text-[10px] text-green-700">{reniecFileName}</span>
+                  <span className="ml-auto shrink-0 text-[9px] font-medium text-green-600">✓ Datos cargados</span>
+                </div>
+              )}
             </div>
           </Field>
           <Field label="Nombres y Apellidos" required>

@@ -40,6 +40,8 @@ export const Route = createFileRoute("/proyectos/$projectId/predios/$codigo/expe
 const inputCls =
   "h-8 w-full rounded border border-gray-300 bg-white px-2 text-[12px] focus:border-gray-500 focus:outline-none";
 
+const SAMPLE_PDF_URL = "/documents/AERO-OXAPAMPA-PR-089.pdf";
+
 type Decision = "PENDIENTE" | "VISTO BUENO" | "OBSERVADO";
 
 type DocumentDefinition = {
@@ -432,10 +434,8 @@ function ExpedienteDigitalPage() {
       return;
     }
     printLinkHandled.current = true;
-    const blob = createCompleteExpedientePdfBlob(DOCUMENTS, reviews, decodedCodigo, projectLabel);
-    const url = URL.createObjectURL(blob);
-    window.location.assign(url);
-  }, [decodedCodigo, projectLabel, reviews, sharedAccess]);
+    window.open(SAMPLE_PDF_URL, "_blank");
+  }, [sharedAccess]);
 
   const groupedDocuments = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -528,13 +528,14 @@ function ExpedienteDigitalPage() {
   }
 
   function printCompleteExpediente() {
-    const blob = createCompleteExpedientePdfBlob(DOCUMENTS, reviews, decodedCodigo, projectLabel);
-    openPrintableBlob(blob, `expediente_completo_${slug(decodedCodigo)}.pdf`);
+    const printWindow = window.open(SAMPLE_PDF_URL, "_blank");
+    if (!printWindow) {
+      downloadFromUrl(SAMPLE_PDF_URL, `expediente_completo_${slug(decodedCodigo)}.pdf`);
+    }
   }
 
   function downloadSelectedDocument() {
-    const blob = createDocumentPdfBlob(selectedDocument, decodedCodigo, projectLabel);
-    downloadBlob(documentFileName(selectedDocument), blob);
+    downloadFromUrl(SAMPLE_PDF_URL, documentFileName(selectedDocument));
   }
 
   if (sharedAccess.mode && !sharedAccess.granted) {
@@ -1314,6 +1315,21 @@ function downloadBlob(fileName: string, blob: Blob) {
   anchor.click();
   anchor.remove();
   URL.revokeObjectURL(url);
+}
+
+async function downloadFromUrl(url: string, fileName: string) {
+  try {
+    const response = await fetch(url);
+    const blob = await response.blob();
+    downloadBlob(fileName, blob);
+  } catch {
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = fileName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  }
 }
 
 function slug(value: string) {

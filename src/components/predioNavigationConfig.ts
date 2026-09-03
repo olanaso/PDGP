@@ -49,6 +49,7 @@ export type PredioRoute =
   | "/proyectos/$projectId/predios/$codigo/entrega-posesion"
   | "/proyectos/$projectId/predios/$codigo/saneamiento-registral"
   | "/proyectos/$projectId/predios/$codigo/inscripcion-registral"
+  | "/proyectos/$projectId/predios/$codigo/inscripcion-registral-sid"
   | "/proyectos/$projectId/predios/$codigo/transferencia-interestatal-sbn"
   | "/proyectos/$projectId/predios/$codigo/entrega-recepcion-ddp-opat"
   | "/proyectos/$projectId/predios/$codigo/transferencia-documentaria-opat"
@@ -269,13 +270,18 @@ const sanitationRegistrationMenuItem: ContextMenuItem = {
       description: "Tipo de saneamiento, trámite, fecha, observaciones y estado",
     },
     {
+      key: "inscripcion-registral-sid",
+      label: "5.2 Presentación SID",
+      description: "Envío del acto administrativo a SUNARP a través de la PIDE",
+    },
+    {
       key: "inscripcion-registral",
-      label: "5.2 Inscripción registral",
+      label: "5.3 Inscripción registral",
       description: "Título SUNARP, asiento, partida, fecha de inscripción y propietario final",
     },
     {
       key: "transferencia-interestatal-sbn",
-      label: "5.3 Transferencia interestatal – SBN",
+      label: "5.4 Transferencia interestatal – SBN",
       description: "Solicitud, resolución, entidad transferente, entidad beneficiaria y estado",
     },
   ],
@@ -391,6 +397,7 @@ export const routeByKey: Partial<Record<string, PredioRoute>> = {
   "entrega-posesion": "/proyectos/$projectId/predios/$codigo/entrega-posesion",
   "saneamiento-registral": "/proyectos/$projectId/predios/$codigo/saneamiento-registral",
   "inscripcion-registral": "/proyectos/$projectId/predios/$codigo/inscripcion-registral",
+  "inscripcion-registral-sid": "/proyectos/$projectId/predios/$codigo/inscripcion-registral-sid",
   "transferencia-interestatal-sbn":
     "/proyectos/$projectId/predios/$codigo/transferencia-interestatal-sbn",
   "entrega-recepcion-ddp-opat": "/proyectos/$projectId/predios/$codigo/entrega-recepcion-ddp-opat",
@@ -449,5 +456,6 @@ export const iconByKey = {
   "registro-resolucion-sbn-publicacion-diario": FileCode,
   "entrega-posesion": Home,
   "inscripcion-registral": FileCode,
+  "inscripcion-registral-sid": Landmark,
   "cierre-adquisicion-entrega-opat": ClipboardCheck,
 } as const;

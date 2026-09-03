@@ -75,6 +75,7 @@ import { Route as ProyectosProjectIdPrediosCodigoPagoConsignacionRouteImport } f
 import { Route as ProyectosProjectIdPrediosCodigoMonitoreoRouteImport } from './routes/proyectos.$projectId.predios.$codigo.monitoreo'
 import { Route as ProyectosProjectIdPrediosCodigoModalidadAdquisicionRouteImport } from './routes/proyectos.$projectId.predios.$codigo.modalidad-adquisicion'
 import { Route as ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaRouteImport } from './routes/proyectos.$projectId.predios.$codigo.levantamiento-informacion-tecnica'
+import { Route as ProyectosProjectIdPrediosCodigoInscripcionRegistralSidRouteImport } from './routes/proyectos.$projectId.predios.$codigo.inscripcion-registral-sid'
 import { Route as ProyectosProjectIdPrediosCodigoInscripcionRegistralRouteImport } from './routes/proyectos.$projectId.predios.$codigo.inscripcion-registral'
 import { Route as ProyectosProjectIdPrediosCodigoInformeVerificadorEspecialistaRouteImport } from './routes/proyectos.$projectId.predios.$codigo.informe-verificador-especialista'
 import { Route as ProyectosProjectIdPrediosCodigoInformeTecnicoLegalRouteImport } from './routes/proyectos.$projectId.predios.$codigo.informe-tecnico-legal'
@@ -481,6 +482,12 @@ const ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaRoute =
       getParentRoute: () => rootRouteImport,
     } as any,
   )
+const ProyectosProjectIdPrediosCodigoInscripcionRegistralSidRoute =
+  ProyectosProjectIdPrediosCodigoInscripcionRegistralSidRouteImport.update({
+    id: '/proyectos/$projectId/predios/$codigo/inscripcion-registral-sid',
+    path: '/proyectos/$projectId/predios/$codigo/inscripcion-registral-sid',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const ProyectosProjectIdPrediosCodigoInscripcionRegistralRoute =
   ProyectosProjectIdPrediosCodigoInscripcionRegistralRouteImport.update({
     id: '/proyectos/$projectId/predios/$codigo/inscripcion-registral',
@@ -728,6 +735,7 @@ export interface FileRoutesByFullPath {
   '/proyectos/$projectId/predios/$codigo/informe-tecnico-legal': typeof ProyectosProjectIdPrediosCodigoInformeTecnicoLegalRoute
   '/proyectos/$projectId/predios/$codigo/informe-verificador-especialista': typeof ProyectosProjectIdPrediosCodigoInformeVerificadorEspecialistaRoute
   '/proyectos/$projectId/predios/$codigo/inscripcion-registral': typeof ProyectosProjectIdPrediosCodigoInscripcionRegistralRoute
+  '/proyectos/$projectId/predios/$codigo/inscripcion-registral-sid': typeof ProyectosProjectIdPrediosCodigoInscripcionRegistralSidRoute
   '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica': typeof ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaRoute
   '/proyectos/$projectId/predios/$codigo/modalidad-adquisicion': typeof ProyectosProjectIdPrediosCodigoModalidadAdquisicionRoute
   '/proyectos/$projectId/predios/$codigo/monitoreo': typeof ProyectosProjectIdPrediosCodigoMonitoreoRoute
@@ -819,6 +827,7 @@ export interface FileRoutesByTo {
   '/proyectos/$projectId/predios/$codigo/informe-tecnico-legal': typeof ProyectosProjectIdPrediosCodigoInformeTecnicoLegalRoute
   '/proyectos/$projectId/predios/$codigo/informe-verificador-especialista': typeof ProyectosProjectIdPrediosCodigoInformeVerificadorEspecialistaRoute
   '/proyectos/$projectId/predios/$codigo/inscripcion-registral': typeof ProyectosProjectIdPrediosCodigoInscripcionRegistralRoute
+  '/proyectos/$projectId/predios/$codigo/inscripcion-registral-sid': typeof ProyectosProjectIdPrediosCodigoInscripcionRegistralSidRoute
   '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica': typeof ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaRoute
   '/proyectos/$projectId/predios/$codigo/modalidad-adquisicion': typeof ProyectosProjectIdPrediosCodigoModalidadAdquisicionRoute
   '/proyectos/$projectId/predios/$codigo/monitoreo': typeof ProyectosProjectIdPrediosCodigoMonitoreoRoute
@@ -914,6 +923,7 @@ export interface FileRoutesById {
   '/proyectos/$projectId/predios/$codigo/informe-tecnico-legal': typeof ProyectosProjectIdPrediosCodigoInformeTecnicoLegalRoute
   '/proyectos/$projectId/predios/$codigo/informe-verificador-especialista': typeof ProyectosProjectIdPrediosCodigoInformeVerificadorEspecialistaRoute
   '/proyectos/$projectId/predios/$codigo/inscripcion-registral': typeof ProyectosProjectIdPrediosCodigoInscripcionRegistralRoute
+  '/proyectos/$projectId/predios/$codigo/inscripcion-registral-sid': typeof ProyectosProjectIdPrediosCodigoInscripcionRegistralSidRoute
   '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica': typeof ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaRoute
   '/proyectos/$projectId/predios/$codigo/modalidad-adquisicion': typeof ProyectosProjectIdPrediosCodigoModalidadAdquisicionRoute
   '/proyectos/$projectId/predios/$codigo/monitoreo': typeof ProyectosProjectIdPrediosCodigoMonitoreoRoute
@@ -1010,6 +1020,7 @@ export interface FileRouteTypes {
     | '/proyectos/$projectId/predios/$codigo/informe-tecnico-legal'
     | '/proyectos/$projectId/predios/$codigo/informe-verificador-especialista'
     | '/proyectos/$projectId/predios/$codigo/inscripcion-registral'
+    | '/proyectos/$projectId/predios/$codigo/inscripcion-registral-sid'
     | '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica'
     | '/proyectos/$projectId/predios/$codigo/modalidad-adquisicion'
     | '/proyectos/$projectId/predios/$codigo/monitoreo'
@@ -1101,6 +1112,7 @@ export interface FileRouteTypes {
     | '/proyectos/$projectId/predios/$codigo/informe-tecnico-legal'
     | '/proyectos/$projectId/predios/$codigo/informe-verificador-especialista'
     | '/proyectos/$projectId/predios/$codigo/inscripcion-registral'
+    | '/proyectos/$projectId/predios/$codigo/inscripcion-registral-sid'
     | '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica'
     | '/proyectos/$projectId/predios/$codigo/modalidad-adquisicion'
     | '/proyectos/$projectId/predios/$codigo/monitoreo'
@@ -1195,6 +1207,7 @@ export interface FileRouteTypes {
     | '/proyectos/$projectId/predios/$codigo/informe-tecnico-legal'
     | '/proyectos/$projectId/predios/$codigo/informe-verificador-especialista'
     | '/proyectos/$projectId/predios/$codigo/inscripcion-registral'
+    | '/proyectos/$projectId/predios/$codigo/inscripcion-registral-sid'
     | '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica'
     | '/proyectos/$projectId/predios/$codigo/modalidad-adquisicion'
     | '/proyectos/$projectId/predios/$codigo/monitoreo'
@@ -1267,6 +1280,7 @@ export interface RootRouteChildren {
   ProyectosProjectIdPrediosCodigoInformeTecnicoLegalRoute: typeof ProyectosProjectIdPrediosCodigoInformeTecnicoLegalRoute
   ProyectosProjectIdPrediosCodigoInformeVerificadorEspecialistaRoute: typeof ProyectosProjectIdPrediosCodigoInformeVerificadorEspecialistaRoute
   ProyectosProjectIdPrediosCodigoInscripcionRegistralRoute: typeof ProyectosProjectIdPrediosCodigoInscripcionRegistralRoute
+  ProyectosProjectIdPrediosCodigoInscripcionRegistralSidRoute: typeof ProyectosProjectIdPrediosCodigoInscripcionRegistralSidRoute
   ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaRoute: typeof ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaRoute
   ProyectosProjectIdPrediosCodigoModalidadAdquisicionRoute: typeof ProyectosProjectIdPrediosCodigoModalidadAdquisicionRoute
   ProyectosProjectIdPrediosCodigoMonitoreoRoute: typeof ProyectosProjectIdPrediosCodigoMonitoreoRoute
@@ -1746,6 +1760,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/proyectos/$projectId/predios/$codigo/inscripcion-registral-sid': {
+      id: '/proyectos/$projectId/predios/$codigo/inscripcion-registral-sid'
+      path: '/proyectos/$projectId/predios/$codigo/inscripcion-registral-sid'
+      fullPath: '/proyectos/$projectId/predios/$codigo/inscripcion-registral-sid'
+      preLoaderRoute: typeof ProyectosProjectIdPrediosCodigoInscripcionRegistralSidRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/proyectos/$projectId/predios/$codigo/inscripcion-registral': {
       id: '/proyectos/$projectId/predios/$codigo/inscripcion-registral'
       path: '/proyectos/$projectId/predios/$codigo/inscripcion-registral'
@@ -2111,6 +2132,8 @@ const rootRouteChildren: RootRouteChildren = {
     ProyectosProjectIdPrediosCodigoInformeVerificadorEspecialistaRoute,
   ProyectosProjectIdPrediosCodigoInscripcionRegistralRoute:
     ProyectosProjectIdPrediosCodigoInscripcionRegistralRoute,
+  ProyectosProjectIdPrediosCodigoInscripcionRegistralSidRoute:
+    ProyectosProjectIdPrediosCodigoInscripcionRegistralSidRoute,
   ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaRoute:
     ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaRoute,
   ProyectosProjectIdPrediosCodigoModalidadAdquisicionRoute:
