@@ -3,7 +3,7 @@ import { useState, useMemo, useEffect, useRef } from "react";
 import { AppSidebar } from "../components/AppSidebar";
 import { proyectos } from "@/lib/projectsData";
 import {
-  Wallet,
+  Target,
   Calendar,
   Edit,
   History,
@@ -17,7 +17,15 @@ import {
 } from "lucide-react";
 
 export const Route = createFileRoute("/gestion-presupuestal")({
-  head: () => ({ meta: [{ title: "Gestión Presupuestal" }] }),
+  head: () => ({
+    meta: [
+      { title: "Metas" },
+      {
+        name: "description",
+        content: "Programación, reprogramación y seguimiento de metas físicas y financieras.",
+      },
+    ],
+  }),
   component: Page,
 });
 
@@ -272,8 +280,13 @@ function Page() {
       <AppSidebar />
       <main className="flex-1 p-6">
         <div className="flex items-center gap-3 mb-4">
-          <Wallet size={20} className="text-[#dc2626]" />
-          <h1 className="text-[18px] font-semibold text-[#111]">Gestión Presupuestal</h1>
+          <Target size={20} className="text-[#dc2626]" />
+          <div>
+            <h1 className="text-[18px] font-semibold text-[#111]">Metas</h1>
+            <p className="text-[11px] text-gray-500">
+              Programación y seguimiento de metas físicas y financieras por proyecto.
+            </p>
+          </div>
         </div>
 
         <div className="bg-white border rounded-md p-4">

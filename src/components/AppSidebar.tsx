@@ -19,6 +19,7 @@ import {
   ClipboardCheck,
   LineChart,
   Wallet,
+  Target,
   FolderArchive,
   Banknote,
   BarChart3,
@@ -94,6 +95,16 @@ export function AppSidebar() {
 
       <nav className="flex-1 overflow-y-auto py-2 text-[13px]">
         <div className="px-4 pt-2 pb-1 text-[11px] text-[#6b7280]">Gestión predial</div>
+        <Link
+          to="/mapa"
+          className={`flex items-center gap-2 mx-2 px-2 py-1.5 rounded-md text-[13px] ${
+            path === "/mapa"
+              ? "bg-[#dc2626] text-white font-medium"
+              : "hover:bg-[#f3f4f6] text-[#374151]"
+          }`}
+        >
+          <MapIcon size={15} /> Mapa de proyectos
+        </Link>
         <Link
           to="/proyectos"
           className={`flex items-center gap-2 mx-2 px-2 py-1.5 rounded-md text-[13px] ${
@@ -311,7 +322,7 @@ export function AppSidebar() {
           </div>
         )}
         <Link to="/gestion-presupuestal" className={linkCls(path === "/gestion-presupuestal")}>
-          <Wallet size={15} /> Gestión Presupuestal
+          <Target size={15} /> Metas
         </Link>
         <Link to="/gestion-documental" className={linkCls(path === "/gestion-documental")}>
           <FolderArchive size={15} /> Gestión Documental

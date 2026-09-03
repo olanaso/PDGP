@@ -45,6 +45,10 @@ export const Route = createFileRoute("/proyectos/$projectId/predios/$codigo/cara
 });
 
 const RED = "#dc2626";
+const MEMORIA_DESCRIPTIVA_FILE_NAME = "35412023_20260903_ITT.doc";
+const MEMORIA_DESCRIPTIVA_URL = `${import.meta.env.BASE_URL}documents/${MEMORIA_DESCRIPTIVA_FILE_NAME}`;
+const DATA_TEMPLATE_DOWNLOAD_URL =
+  "https://drive.google.com/uc?id=17nJ9tRmPRJYtE8bvhIEkAv_fjMf50CcX&export=download";
 const inputCls = "h-8 px-2 text-[12px] border border-gray-300 rounded w-full bg-white focus:outline-none focus:border-gray-500";
 const selectCls = `${inputCls} appearance-none bg-white`;
 const readOnlyCls = `${inputCls} bg-gray-50 text-gray-700`;
@@ -203,16 +207,13 @@ function CaracterizacionPredioPage () {
   }
 
   function handleGenerateMemoriaDescriptiva() {
-    const baseCode = getDocumentBaseCode(predio?.cod || decodedCodigo);
-    downloadBlobFile(
-      `memoria_descriptiva_${baseCode}.doc`,
-      createMemoriaDescriptivaBlob({
-        codigo: predio?.cod || decodedCodigo,
-        predio,
-        projectLabel,
-      }),
-    );
-    setMessage("Memoria descriptiva generada correctamente.");
+    const link = document.createElement("a");
+    link.href = MEMORIA_DESCRIPTIVA_URL;
+    link.download = MEMORIA_DESCRIPTIVA_FILE_NAME;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setMessage("Memoria descriptiva descargada correctamente.");
   }
 
   function handleGenerateMembretadoPlanos() {
@@ -920,9 +921,15 @@ function DatosTecnicosTab ({ codigo }: CaracterizacionTabProps) {
         <div />
 
         <label className="text-right text-gray-700">Descarga Plantilla de Carga de Datos.</label>
-        <button type="button" className="inline-flex size-8 items-center justify-center rounded text-white" style={{ background: RED }}>
+        <a
+          href={DATA_TEMPLATE_DOWNLOAD_URL}
+          aria-label="Descargar plantilla de carga de datos"
+          title="Descargar plantilla de carga de datos"
+          className="inline-flex size-8 items-center justify-center rounded text-white"
+          style={{ background: RED }}
+        >
           <FileSpreadsheet size={14} />
-        </button>
+        </a>
         <div />
 
         <label className="text-right text-gray-700">Archivo de Datos Tecnicos</label>
@@ -3116,38 +3123,6 @@ function DataTable ({ headers, rows }: { headers: string[]; rows: string[][] }) 
 
 function getDocumentBaseCode(codigo: string) {
   return codigo.replace(/[^A-Z0-9-]/gi, "").toUpperCase() || "PREDIO";
-}
-
-function createMemoriaDescriptivaBlob({
-  codigo,
-  predio,
-  projectLabel,
-}: {
-  codigo: string;
-  predio: ReturnType<typeof getPredioByCodigo>;
-  projectLabel: string;
-}) {
-  const fechaEmision = new Date().toLocaleDateString("es-PE", {
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-  });
-  const html = `<!doctype html>
-<html>
-  <head><meta charset="UTF-8" /></head>
-  <body style="font-family: Arial, sans-serif; font-size: 10pt; color: #111827; line-height: 1.5;">
-    <h2 style="text-align: center;">MEMORIA DESCRIPTIVA</h2>
-    <p><b>Fecha de emisión:</b> ${escapeDocumentHtml(fechaEmision)}</p>
-    <p><b>Proyecto:</b> ${escapeDocumentHtml(projectLabel)}</p>
-    <p><b>Código de predio:</b> ${escapeDocumentHtml(codigo)}</p>
-    <p><b>Sujeto pasivo:</b> ${escapeDocumentHtml(predio?.suj || "Sin información")}</p>
-    <p><b>Tipo de predio:</b> ${escapeDocumentHtml(predio?.tipo || predio?.tp || "Sin información")}</p>
-    <p><b>Área afectada:</b> ${escapeDocumentHtml(predio?.area || predio?.m2 || "Sin información")} m²</p>
-    <p>Documento generado con la información disponible en la caracterización del predio.</p>
-  </body>
-</html>`;
-
-  return new Blob([html], { type: "application/msword;charset=utf-8" });
 }
 
 function createMembretadoPlanosBlob({

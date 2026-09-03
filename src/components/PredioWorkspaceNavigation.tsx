@@ -20,6 +20,12 @@ function routeSegment(route: PredioRoute) {
   return route.slice(route.lastIndexOf("/") + 1);
 }
 
+function menuItemMatchesPathname(item: ContextMenuItem, pathname: string): boolean {
+  const route = routeByKey[item.key];
+  if (route && pathname.endsWith(`/${routeSegment(route)}`)) return true;
+  return item.children?.some((child) => menuItemMatchesPathname(child, pathname)) ?? false;
+}
+
 function currentPredioRoute(pathname: string) {
   return (
     Object.values(routeByKey).find((route) => pathname.endsWith(`/${routeSegment(route)}`)) ??
@@ -165,10 +171,7 @@ function SidebarItem({
   const paddingLeft = depth === 0 ? 12 : 40 + (depth - 1) * 16;
 
   if (item.children?.length) {
-    const childIsActive = item.children.some((child) => {
-      const childRoute = routeByKey[child.key];
-      return childRoute ? pathname.endsWith(`/${routeSegment(childRoute)}`) : false;
-    });
+    const childIsActive = item.children.some((child) => menuItemMatchesPathname(child, pathname));
 
     return (
       <div>

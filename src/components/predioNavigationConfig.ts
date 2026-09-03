@@ -29,6 +29,7 @@ export type PredioRoute =
   | "/proyectos/$projectId/predios/$codigo/diagnostico-preliminar"
   | "/proyectos/$projectId/predios/$codigo/empadronamiento-inspeccion-campo"
   | "/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica"
+  | "/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica/partidas-registrales"
   | "/proyectos/$projectId/predios/$codigo/informe-verificador-especialista"
   | "/proyectos/$projectId/predios/$codigo/cbc"
   | "/proyectos/$projectId/predios/$codigo/comunicacion-afectacion"
@@ -103,6 +104,11 @@ const informationBaseMenuItem: ContextMenuItem = {
       key: "levantamiento-informacion-tecnica",
       label: "1.6 Levantamiento de información técnica",
       description: "Áreas, linderos, coordenadas, planos, información técnica y archivos adjuntos",
+    },
+    {
+      key: "partidas-registrales",
+      label: "1.7 Partidas registrales",
+      description: "Consulta por oficina y número de partida, asientos y archivos PDF",
     },
   ],
 };
@@ -358,6 +364,8 @@ export const routeByKey: Partial<Record<string, PredioRoute>> = {
     "/proyectos/$projectId/predios/$codigo/empadronamiento-inspeccion-campo",
   "levantamiento-informacion-tecnica":
     "/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica",
+  "partidas-registrales":
+    "/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica/partidas-registrales",
   "informe-verificador-especialista":
     "/proyectos/$projectId/predios/$codigo/informe-verificador-especialista",
   cbc: "/proyectos/$projectId/predios/$codigo/cbc",

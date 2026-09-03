@@ -11,10 +11,12 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as VerificarRouteImport } from './routes/verificar'
 import { Route as ServiciosRouteImport } from './routes/servicios'
+import { Route as SeguimientoSujetoPasivoRouteImport } from './routes/seguimiento-sujeto-pasivo'
 import { Route as SeguimientoMonitoreoRouteImport } from './routes/seguimiento-monitoreo'
 import { Route as SeguimientoAdquisicionRouteImport } from './routes/seguimiento-adquisicion'
 import { Route as RecuperarRouteImport } from './routes/recuperar'
 import { Route as PagoConsignacionRouteImport } from './routes/pago-consignacion'
+import { Route as MapaRouteImport } from './routes/mapa'
 import { Route as InteroperabilidadRouteImport } from './routes/interoperabilidad'
 import { Route as GestionPresupuestalRouteImport } from './routes/gestion-presupuestal'
 import { Route as GestionPredialSocialRouteImport } from './routes/gestion-predial-social'
@@ -98,6 +100,7 @@ import { Route as ProyectosProjectIdPrediosCodigoCartaIntencionRouteImport } fro
 import { Route as ProyectosProjectIdPrediosCodigoCaracterizacionPredioRouteImport } from './routes/proyectos.$projectId.predios.$codigo.caracterizacion-predio'
 import { Route as ProyectosProjectIdPrediosCodigoAsignacionPredialRouteImport } from './routes/proyectos.$projectId.predios.$codigo.asignacion-predial'
 import { Route as ProyectosProjectIdPrediosCodigoAnotacionPreventivaRouteImport } from './routes/proyectos.$projectId.predios.$codigo.anotacion-preventiva'
+import { Route as ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaPartidasRegistralesRouteImport } from './routes/proyectos.$projectId.predios.$codigo.levantamiento-informacion-tecnica_.partidas-registrales'
 
 const VerificarRoute = VerificarRouteImport.update({
   id: '/verificar',
@@ -107,6 +110,11 @@ const VerificarRoute = VerificarRouteImport.update({
 const ServiciosRoute = ServiciosRouteImport.update({
   id: '/servicios',
   path: '/servicios',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SeguimientoSujetoPasivoRoute = SeguimientoSujetoPasivoRouteImport.update({
+  id: '/seguimiento-sujeto-pasivo',
+  path: '/seguimiento-sujeto-pasivo',
   getParentRoute: () => rootRouteImport,
 } as any)
 const SeguimientoMonitoreoRoute = SeguimientoMonitoreoRouteImport.update({
@@ -127,6 +135,11 @@ const RecuperarRoute = RecuperarRouteImport.update({
 const PagoConsignacionRoute = PagoConsignacionRouteImport.update({
   id: '/pago-consignacion',
   path: '/pago-consignacion',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const MapaRoute = MapaRouteImport.update({
+  id: '/mapa',
+  path: '/mapa',
   getParentRoute: () => rootRouteImport,
 } as any)
 const InteroperabilidadRoute = InteroperabilidadRouteImport.update({
@@ -626,6 +639,14 @@ const ProyectosProjectIdPrediosCodigoAnotacionPreventivaRoute =
     path: '/proyectos/$projectId/predios/$codigo/anotacion-preventiva',
     getParentRoute: () => rootRouteImport,
   } as any)
+const ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaPartidasRegistralesRoute =
+  ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaPartidasRegistralesRouteImport.update(
+    {
+      id: '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica_/partidas-registrales',
+      path: '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica/partidas-registrales',
+      getParentRoute: () => rootRouteImport,
+    } as any,
+  )
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -633,10 +654,12 @@ export interface FileRoutesByFullPath {
   '/gestion-predial-social': typeof GestionPredialSocialRoute
   '/gestion-presupuestal': typeof GestionPresupuestalRoute
   '/interoperabilidad': typeof InteroperabilidadRoute
+  '/mapa': typeof MapaRoute
   '/pago-consignacion': typeof PagoConsignacionRoute
   '/recuperar': typeof RecuperarRoute
   '/seguimiento-adquisicion': typeof SeguimientoAdquisicionRoute
   '/seguimiento-monitoreo': typeof SeguimientoMonitoreoRouteWithChildren
+  '/seguimiento-sujeto-pasivo': typeof SeguimientoSujetoPasivoRoute
   '/servicios': typeof ServiciosRoute
   '/verificar': typeof VerificarRoute
   '/configuracion/correos': typeof ConfiguracionCorreosRoute
@@ -717,6 +740,7 @@ export interface FileRoutesByFullPath {
   '/proyectos/$projectId/predios/$codigo/sujeto-pasivo': typeof ProyectosProjectIdPrediosCodigoSujetoPasivoRoute
   '/proyectos/$projectId/predios/$codigo/transferencia-documentaria-opat': typeof ProyectosProjectIdPrediosCodigoTransferenciaDocumentariaOpatRoute
   '/proyectos/$projectId/predios/$codigo/transferencia-interestatal-sbn': typeof ProyectosProjectIdPrediosCodigoTransferenciaInterestatalSbnRoute
+  '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica/partidas-registrales': typeof ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaPartidasRegistralesRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -724,9 +748,11 @@ export interface FileRoutesByTo {
   '/gestion-predial-social': typeof GestionPredialSocialRoute
   '/gestion-presupuestal': typeof GestionPresupuestalRoute
   '/interoperabilidad': typeof InteroperabilidadRoute
+  '/mapa': typeof MapaRoute
   '/pago-consignacion': typeof PagoConsignacionRoute
   '/recuperar': typeof RecuperarRoute
   '/seguimiento-adquisicion': typeof SeguimientoAdquisicionRoute
+  '/seguimiento-sujeto-pasivo': typeof SeguimientoSujetoPasivoRoute
   '/servicios': typeof ServiciosRoute
   '/verificar': typeof VerificarRoute
   '/configuracion/correos': typeof ConfiguracionCorreosRoute
@@ -805,6 +831,7 @@ export interface FileRoutesByTo {
   '/proyectos/$projectId/predios/$codigo/sujeto-pasivo': typeof ProyectosProjectIdPrediosCodigoSujetoPasivoRoute
   '/proyectos/$projectId/predios/$codigo/transferencia-documentaria-opat': typeof ProyectosProjectIdPrediosCodigoTransferenciaDocumentariaOpatRoute
   '/proyectos/$projectId/predios/$codigo/transferencia-interestatal-sbn': typeof ProyectosProjectIdPrediosCodigoTransferenciaInterestatalSbnRoute
+  '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica/partidas-registrales': typeof ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaPartidasRegistralesRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -813,10 +840,12 @@ export interface FileRoutesById {
   '/gestion-predial-social': typeof GestionPredialSocialRoute
   '/gestion-presupuestal': typeof GestionPresupuestalRoute
   '/interoperabilidad': typeof InteroperabilidadRoute
+  '/mapa': typeof MapaRoute
   '/pago-consignacion': typeof PagoConsignacionRoute
   '/recuperar': typeof RecuperarRoute
   '/seguimiento-adquisicion': typeof SeguimientoAdquisicionRoute
   '/seguimiento-monitoreo': typeof SeguimientoMonitoreoRouteWithChildren
+  '/seguimiento-sujeto-pasivo': typeof SeguimientoSujetoPasivoRoute
   '/servicios': typeof ServiciosRoute
   '/verificar': typeof VerificarRoute
   '/configuracion/correos': typeof ConfiguracionCorreosRoute
@@ -897,6 +926,7 @@ export interface FileRoutesById {
   '/proyectos/$projectId/predios/$codigo/sujeto-pasivo': typeof ProyectosProjectIdPrediosCodigoSujetoPasivoRoute
   '/proyectos/$projectId/predios/$codigo/transferencia-documentaria-opat': typeof ProyectosProjectIdPrediosCodigoTransferenciaDocumentariaOpatRoute
   '/proyectos/$projectId/predios/$codigo/transferencia-interestatal-sbn': typeof ProyectosProjectIdPrediosCodigoTransferenciaInterestatalSbnRoute
+  '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica_/partidas-registrales': typeof ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaPartidasRegistralesRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -906,10 +936,12 @@ export interface FileRouteTypes {
     | '/gestion-predial-social'
     | '/gestion-presupuestal'
     | '/interoperabilidad'
+    | '/mapa'
     | '/pago-consignacion'
     | '/recuperar'
     | '/seguimiento-adquisicion'
     | '/seguimiento-monitoreo'
+    | '/seguimiento-sujeto-pasivo'
     | '/servicios'
     | '/verificar'
     | '/configuracion/correos'
@@ -990,6 +1022,7 @@ export interface FileRouteTypes {
     | '/proyectos/$projectId/predios/$codigo/sujeto-pasivo'
     | '/proyectos/$projectId/predios/$codigo/transferencia-documentaria-opat'
     | '/proyectos/$projectId/predios/$codigo/transferencia-interestatal-sbn'
+    | '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica/partidas-registrales'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -997,9 +1030,11 @@ export interface FileRouteTypes {
     | '/gestion-predial-social'
     | '/gestion-presupuestal'
     | '/interoperabilidad'
+    | '/mapa'
     | '/pago-consignacion'
     | '/recuperar'
     | '/seguimiento-adquisicion'
+    | '/seguimiento-sujeto-pasivo'
     | '/servicios'
     | '/verificar'
     | '/configuracion/correos'
@@ -1078,6 +1113,7 @@ export interface FileRouteTypes {
     | '/proyectos/$projectId/predios/$codigo/sujeto-pasivo'
     | '/proyectos/$projectId/predios/$codigo/transferencia-documentaria-opat'
     | '/proyectos/$projectId/predios/$codigo/transferencia-interestatal-sbn'
+    | '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica/partidas-registrales'
   id:
     | '__root__'
     | '/'
@@ -1085,10 +1121,12 @@ export interface FileRouteTypes {
     | '/gestion-predial-social'
     | '/gestion-presupuestal'
     | '/interoperabilidad'
+    | '/mapa'
     | '/pago-consignacion'
     | '/recuperar'
     | '/seguimiento-adquisicion'
     | '/seguimiento-monitoreo'
+    | '/seguimiento-sujeto-pasivo'
     | '/servicios'
     | '/verificar'
     | '/configuracion/correos'
@@ -1169,6 +1207,7 @@ export interface FileRouteTypes {
     | '/proyectos/$projectId/predios/$codigo/sujeto-pasivo'
     | '/proyectos/$projectId/predios/$codigo/transferencia-documentaria-opat'
     | '/proyectos/$projectId/predios/$codigo/transferencia-interestatal-sbn'
+    | '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica_/partidas-registrales'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -1177,10 +1216,12 @@ export interface RootRouteChildren {
   GestionPredialSocialRoute: typeof GestionPredialSocialRoute
   GestionPresupuestalRoute: typeof GestionPresupuestalRoute
   InteroperabilidadRoute: typeof InteroperabilidadRoute
+  MapaRoute: typeof MapaRoute
   PagoConsignacionRoute: typeof PagoConsignacionRoute
   RecuperarRoute: typeof RecuperarRoute
   SeguimientoAdquisicionRoute: typeof SeguimientoAdquisicionRoute
   SeguimientoMonitoreoRoute: typeof SeguimientoMonitoreoRouteWithChildren
+  SeguimientoSujetoPasivoRoute: typeof SeguimientoSujetoPasivoRoute
   ServiciosRoute: typeof ServiciosRoute
   VerificarRoute: typeof VerificarRoute
   ConfiguracionCorreosRoute: typeof ConfiguracionCorreosRoute
@@ -1238,6 +1279,7 @@ export interface RootRouteChildren {
   ProyectosProjectIdPrediosCodigoSujetoPasivoRoute: typeof ProyectosProjectIdPrediosCodigoSujetoPasivoRoute
   ProyectosProjectIdPrediosCodigoTransferenciaDocumentariaOpatRoute: typeof ProyectosProjectIdPrediosCodigoTransferenciaDocumentariaOpatRoute
   ProyectosProjectIdPrediosCodigoTransferenciaInterestatalSbnRoute: typeof ProyectosProjectIdPrediosCodigoTransferenciaInterestatalSbnRoute
+  ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaPartidasRegistralesRoute: typeof ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaPartidasRegistralesRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -1254,6 +1296,13 @@ declare module '@tanstack/react-router' {
       path: '/servicios'
       fullPath: '/servicios'
       preLoaderRoute: typeof ServiciosRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/seguimiento-sujeto-pasivo': {
+      id: '/seguimiento-sujeto-pasivo'
+      path: '/seguimiento-sujeto-pasivo'
+      fullPath: '/seguimiento-sujeto-pasivo'
+      preLoaderRoute: typeof SeguimientoSujetoPasivoRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/seguimiento-monitoreo': {
@@ -1282,6 +1331,13 @@ declare module '@tanstack/react-router' {
       path: '/pago-consignacion'
       fullPath: '/pago-consignacion'
       preLoaderRoute: typeof PagoConsignacionRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/mapa': {
+      id: '/mapa'
+      path: '/mapa'
+      fullPath: '/mapa'
+      preLoaderRoute: typeof MapaRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/interoperabilidad': {
@@ -1865,6 +1921,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ProyectosProjectIdPrediosCodigoAnotacionPreventivaRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica_/partidas-registrales': {
+      id: '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica_/partidas-registrales'
+      path: '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica/partidas-registrales'
+      fullPath: '/proyectos/$projectId/predios/$codigo/levantamiento-informacion-tecnica/partidas-registrales'
+      preLoaderRoute: typeof ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaPartidasRegistralesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -1969,10 +2032,12 @@ const rootRouteChildren: RootRouteChildren = {
   GestionPredialSocialRoute: GestionPredialSocialRoute,
   GestionPresupuestalRoute: GestionPresupuestalRoute,
   InteroperabilidadRoute: InteroperabilidadRoute,
+  MapaRoute: MapaRoute,
   PagoConsignacionRoute: PagoConsignacionRoute,
   RecuperarRoute: RecuperarRoute,
   SeguimientoAdquisicionRoute: SeguimientoAdquisicionRoute,
   SeguimientoMonitoreoRoute: SeguimientoMonitoreoRouteWithChildren,
+  SeguimientoSujetoPasivoRoute: SeguimientoSujetoPasivoRoute,
   ServiciosRoute: ServiciosRoute,
   VerificarRoute: VerificarRoute,
   ConfiguracionCorreosRoute: ConfiguracionCorreosRoute,
@@ -2070,6 +2135,8 @@ const rootRouteChildren: RootRouteChildren = {
     ProyectosProjectIdPrediosCodigoTransferenciaDocumentariaOpatRoute,
   ProyectosProjectIdPrediosCodigoTransferenciaInterestatalSbnRoute:
     ProyectosProjectIdPrediosCodigoTransferenciaInterestatalSbnRoute,
+  ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaPartidasRegistralesRoute:
+    ProyectosProjectIdPrediosCodigoLevantamientoInformacionTecnicaPartidasRegistralesRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

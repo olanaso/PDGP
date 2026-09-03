@@ -7,7 +7,11 @@ export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
       { title: "Iniciar sesión — MTC" },
-      { name: "description", content: "Acceso al sistema de Gestión Predial del Ministerio de Transportes y Comunicaciones." },
+      {
+        name: "description",
+        content:
+          "Acceso al sistema de Gestión Predial del Ministerio de Transportes y Comunicaciones.",
+      },
     ],
   }),
   component: LoginPage,
@@ -35,7 +39,9 @@ function LoginPage() {
       <div className="w-full max-w-[420px]">
         <div className="bg-white rounded-md shadow-xl pt-8 pb-6 px-8 border-t-4 border-[#dc2626]">
           <h1 className="text-center text-[20px] font-bold text-[#dc2626] tracking-wide leading-tight">
-            PLATAFORMA DIGITAL DE<br />GESTIÓN DE PREDIOS
+            PLATAFORMA DIGITAL DE
+            <br />
+            GESTIÓN DE PREDIOS
           </h1>
           <div className="mx-auto mt-3 h-[2px] w-16 bg-[#dc2626] rounded" />
           <div className="text-center mt-4 text-[12px] font-semibold text-[#6b7280] tracking-wider uppercase">
@@ -82,7 +88,9 @@ function LoginPage() {
                 />
                 Recordar datos
               </label>
-              <Link to="/recuperar" className="text-[#dc2626] hover:underline">Olvidé mi contraseña</Link>
+              <Link to="/recuperar" className="text-[#dc2626] hover:underline">
+                Olvidé mi contraseña
+              </Link>
             </div>
 
             <button
@@ -98,6 +106,12 @@ function LoginPage() {
             >
               SOLICITAR ACCESO AL SISTEMA
             </button>
+            <Link
+              to="/seguimiento-sujeto-pasivo"
+              className="block w-full text-center text-[12px] font-semibold text-[#dc2626] hover:underline"
+            >
+              Consulta de predios para el sujeto pasivo
+            </Link>
           </form>
         </div>
       </div>

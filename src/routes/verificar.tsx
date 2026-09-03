@@ -37,7 +37,7 @@ function VerificarPage() {
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
-    setTimeout(() => navigate({ to: "/proyectos" }), 600);
+    setTimeout(() => navigate({ to: "/mapa" }), 600);
   };
 
   const complete = code.every((c) => c !== "");
@@ -62,7 +62,9 @@ function VerificarPage() {
       <div className="w-full max-w-[420px]">
         <div className="bg-white rounded-md shadow-xl pt-8 pb-6 px-8 border-t-4 border-[#dc2626]">
           <h1 className="text-center text-[20px] font-bold text-[#dc2626] tracking-wide leading-tight">
-            PLATAFORMA DIGITAL DE<br />GESTIÓN DE PREDIOS
+            PLATAFORMA DIGITAL DE
+            <br />
+            GESTIÓN DE PREDIOS
           </h1>
           <div className="mx-auto mt-3 h-[2px] w-16 bg-[#dc2626] rounded" />
           <div className="flex justify-center mt-3">
@@ -77,16 +79,21 @@ function VerificarPage() {
             VERIFICACIÓN EN DOS PASOS
           </div>
           <p className="text-center text-[12px] text-[#374151] mt-3">
-            Ingrese el código de <span className="font-bold">6 dígitos</span> que enviamos a su correo electrónico.
+            Ingrese el código de <span className="font-bold">6 dígitos</span> que enviamos a su
+            correo electrónico.
           </p>
-          <p className="text-center text-[11px] text-[#9ca3af] mt-2">Intentos restantes: {attempts} de 3.</p>
+          <p className="text-center text-[11px] text-[#9ca3af] mt-2">
+            Intentos restantes: {attempts} de 3.
+          </p>
 
           <form onSubmit={submit} className="mt-4">
             <div className="flex justify-center gap-2">
               {code.map((d, i) => (
                 <input
                   key={i}
-                  ref={(el) => { inputs.current[i] = el; }}
+                  ref={(el) => {
+                    inputs.current[i] = el;
+                  }}
                   value={d}
                   onChange={(e) => setDigit(i, e.target.value)}
                   onKeyDown={(e) => onKey(i, e)}
