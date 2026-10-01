@@ -106,25 +106,38 @@ export default function BimViewer({
       while (!viewerRef.current && !cancelled) await new Promise((r) => setTimeout(r, 100));
       const viewer = viewerRef.current;
       if (!viewer || cancelled) return;
-      const { fragments, loader, world, components } = viewer;
+      const { fragments, loader, world } = viewer;
       setStatus("Procesando IFC…");
       for (const [id] of fragments.list) await fragments.core.disposeModel(id);
-      await loader.load(ifcData, false, modelName, {
+      const model = await loader.load(ifcData, false, modelName, {
         instanceCallback: (importer) => importer.addAllRelations(),
       });
       await fragments.core.update(true);
-      const boxer = components.get(OBC.BoundingBoxer);
-      boxer.list.clear();
-      boxer.addFromModels();
-      const box = boxer.get();
-      if (!box.isEmpty())
-        await world.camera.controls.fitToBox(box, true, {
-          paddingLeft: 10,
-          paddingRight: 10,
-          paddingTop: 10,
-          paddingBottom: 10,
-        });
-      boxer.list.clear();
+      // Encuadra el modelo completo (las cajas se calculan en el worker, por eso se piden al modelo).
+      const box = new THREE.Box3();
+      for (const itemBox of await model.getBoxes()) box.union(itemBox);
+      if (!box.isEmpty()) {
+        // Un proyecto predial mide kilómetros: se amplía el plano lejano y se coloca la
+        // cámara en isométrica a una distancia que abarque todo el modelo.
+        const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+        const camera = world.camera.three;
+        camera.far = Math.max(camera.far, size.length() * 10);
+        camera.updateProjectionMatrix();
+        const fov = camera instanceof THREE.PerspectiveCamera ? camera.fov : 60;
+        const distance =
+          (Math.max(size.x, size.z) / (2 * Math.tan(THREE.MathUtils.degToRad(fov) / 2))) * 0.7;
+        world.camera.controls.maxDistance = Infinity;
+        await world.camera.controls.setLookAt(
+          center.x + distance,
+          center.y + distance,
+          center.z + distance,
+          center.x,
+          center.y,
+          center.z,
+          true,
+        );
+      }
       if (!cancelled) setStatus("");
     };
     run().catch((error: unknown) => {
@@ -145,8 +158,8 @@ export default function BimViewer({
     const { fragments, world } = viewer;
     const canvas = container.querySelector("canvas");
     if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const mouse = new THREE.Vector2(event.clientX - rect.left, event.clientY - rect.top);
+    // fragments espera coordenadas de cliente; él mismo las convierte respecto al canvas.
+    const mouse = new THREE.Vector2(event.clientX, event.clientY);
     const hit = await fragments.raycast({ camera: world.camera.three, mouse, dom: canvas });
     await fragments.resetHighlight();
     if (!hit) {
