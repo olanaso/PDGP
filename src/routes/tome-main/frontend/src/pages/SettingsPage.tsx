@@ -1,0 +1,1865 @@
+import { useState, useEffect, useMemo } from 'react'
+import { Link } from 'react-router-dom'
+import {
+  ArrowLeft, ArrowUpCircle, Eye, EyeOff, Download, Check, RefreshCw, Loader2,
+  Copy, Trash2, Plus, Key, Smartphone, CheckCircle, Info, X, ChevronDown, ChevronUp,
+  AlertTriangle, ExternalLink, Send, QrCode,
+} from 'lucide-react'
+import { ConnectPhoneModal } from '@/components/ConnectPhoneModal'
+import { DOCS, docsLink } from '@/lib/docs'
+import { ThemeToggle } from '@/components/ThemeToggle'
+import { NotificationChannels } from '@/components/NotificationChannels'
+import { ReadingImport } from '@/components/ReadingImport'
+import { ShareLinksOverview } from '@/components/ShareLinksOverview'
+import { HardcoverSync } from '@/components/HardcoverSync'
+import { api } from '@/lib/api'
+import { cn } from '@/lib/utils'
+import {
+  listTokens, createToken, revokeToken,
+  type ApiTokenListItem,
+} from '@/lib/tokens'
+import {
+  applyTheme, getStoredTheme, THEMES, type ThemeId,
+  type CustomTheme, loadCustomThemes, saveCustomTheme, deleteCustomTheme, parseThemeColors,
+} from '@/lib/theme'
+import { useAuth } from '@/contexts/AuthContext'
+import { Trans, useLingui } from '@lingui/react/macro'
+import { t, msg } from '@lingui/core/macro'
+import type { MessageDescriptor } from '@lingui/core'
+import { LOCALES, getActiveLocale, setLocale } from '@/lib/i18n'
+
+interface ApiKey {
+  id: number
+  label: string
+  key_preview: string
+  created_at: string
+  last_used_at: string | null
+}
+
+interface OpdsPin {
+  id: number
+  label: string
+  pin_preview: string
+  created_at: string
+  last_used_at: string | null
+}
+
+export function SettingsPage() {
+  const { user, refreshUser } = useAuth()
+
+  // ── Version ──────────────────────────────────────────────────────────────
+  const [tomeVersion, setTomeVersion] = useState('…')
+  useEffect(() => {
+    api.get<{ version: string }>('/health').then(r => setTomeVersion(r.version)).catch(() => {})
+  }, [])
+
+  // Quiet update indicator (admins): daily-cached server-side check against
+  // GitHub releases; renders a link in About only when something is newer.
+  const [updateInfo, setUpdateInfo] = useState<{ latest: string; url: string } | null>(null)
+  useEffect(() => {
+    if (!user?.is_admin) return
+    api
+      .get<{ update_available: boolean; latest: string | null; url: string }>('/meta/update-check')
+      .then(r => {
+        if (r.update_available && r.latest) setUpdateInfo({ latest: r.latest, url: r.url })
+      })
+      .catch(() => {})
+  }, [user?.is_admin])
+
+  // ── SSO linking ────────────────────────────────────────────────────────────
+  const [ssoEnabled, setSsoEnabled] = useState(false)
+  const [ssoMsg, setSsoMsg] = useState<{ ok: boolean; text: string } | null>(null)
+  const [linkingSso, setLinkingSso] = useState(false)
+  useEffect(() => {
+    api.get<{ enabled: boolean }>('/auth/oidc/config').then(r => setSsoEnabled(r.enabled)).catch(() => {})
+    const p = new URLSearchParams(window.location.search)
+    if (p.get('sso_linked')) {
+      setSsoMsg({ ok: true, text: t`SSO sign-in linked to your account.` })
+      refreshUser()
+      window.history.replaceState({}, '', window.location.pathname)
+    }
+    const err = p.get('sso_link_error')
+    if (err) {
+      setSsoMsg({ ok: false, text: err === 'already_linked'
+        ? t`That SSO identity is already linked to another account.`
+        : t`Could not link SSO. Please try again.` })
+      window.history.replaceState({}, '', window.location.pathname)
+    }
+  }, [])
+
+  async function handleLinkSso() {
+    setLinkingSso(true)
+    try {
+      const r = await api.post<{ login_url: string }>('/auth/oidc/link/start', {})
+      window.location.href = r.login_url
+    } catch {
+      setSsoMsg({ ok: false, text: t`Could not start SSO linking.` })
+      setLinkingSso(false)
+    }
+  }
+
+  // ── Profile ───────────────────────────────────────────────────────────────
+  const [profileUsername, setProfileUsername] = useState(user?.username ?? '')
+  const [profileEmail, setProfileEmail] = useState(user?.email ?? '')
+  const [profileSaving, setProfileSaving] = useState(false)
+  const [profileError, setProfileError] = useState<string | null>(null)
+  const [profileSuccess, setProfileSuccess] = useState(false)
+
+  useEffect(() => {
+    setProfileUsername(user?.username ?? '')
+    setProfileEmail(user?.email ?? '')
+  }, [user])
+
+  const profileChanged = profileUsername !== (user?.username ?? '') || profileEmail !== (user?.email ?? '')
+
+  async function handleProfileSubmit(e: React.FormEvent) {
+    e.preventDefault()
+    setProfileError(null)
+    setProfileSuccess(false)
+    setProfileSaving(true)
+    try {
+      await api.put('/auth/me', { username: profileUsername, email: profileEmail })
+      await refreshUser()
+      setProfileSuccess(true)
+      setTimeout(() => setProfileSuccess(false), 3000)
+    } catch (err) {
+      setProfileError(err instanceof Error ? err.message : t`Failed to save`)
+    } finally {
+      setProfileSaving(false)
+    }
+  }
+
+  // ── Password ──────────────────────────────────────────────────────────────
+  const [currentPassword, setCurrentPassword] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [showPasswords, setShowPasswords] = useState(false)
+  const [pwSaving, setPwSaving] = useState(false)
+  const [pwError, setPwError] = useState<string | null>(null)
+  const [pwSuccess, setPwSuccess] = useState(false)
+
+  async function handlePasswordSubmit(e: React.FormEvent) {
+    e.preventDefault()
+    setPwError(null)
+    setPwSuccess(false)
+    if (newPassword !== confirmPassword) { setPwError(t`Passwords do not match`); return }
+    if (newPassword.length < 8) { setPwError(t`Password must be at least 8 characters`); return }
+    setPwSaving(true)
+    try {
+      await api.put('/auth/me/password', { current_password: currentPassword, new_password: newPassword })
+      setPwSuccess(true)
+      setTimeout(() => setPwSuccess(false), 4000)
+      setCurrentPassword(''); setNewPassword(''); setConfirmPassword('')
+    } catch (err: unknown) {
+      setPwError(err instanceof Error ? err.message : t`Failed to change password`)
+    } finally {
+      setPwSaving(false)
+    }
+  }
+
+  // ── Quick Connect ─────────────────────────────────────────────────────────
+  const [qcCode, setQcCode] = useState('')
+  const [qcAuthorizing, setQcAuthorizing] = useState(false)
+  const [qcError, setQcError] = useState<string | null>(null)
+  const [qcSuccess, setQcSuccess] = useState(false)
+  const [showConnectPhone, setShowConnectPhone] = useState(false)
+
+  async function handleQcAuthorize(e: React.FormEvent) {
+    e.preventDefault()
+    setQcError(null)
+    setQcSuccess(false)
+    const code = qcCode.trim().toUpperCase()
+    if (code.length !== 6) { setQcError(t`Code must be 6 characters`); return }
+    setQcAuthorizing(true)
+    try {
+      await api.post('/auth/quick-connect/authorize', { code })
+      setQcSuccess(true)
+      setQcCode('')
+      setTimeout(() => setQcSuccess(false), 5000)
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : t`Failed to authorize`
+      if (msg.includes('not found') || msg.includes('Not Found')) setQcError(t`Code not found. Check the code and try again.`)
+      else if (msg.includes('expired')) setQcError(t`Code has expired. Ask the other device to generate a new one.`)
+      else if (msg.includes('already authorized')) setQcError(t`Code was already authorized.`)
+      else setQcError(msg)
+    } finally {
+      setQcAuthorizing(false)
+    }
+  }
+
+  // ── Language ──────────────────────────────────────────────────────────────
+  const { t, i18n } = useLingui()
+  const [activeLocale, setActiveLocale] = useState<string>(getActiveLocale)
+
+  async function handleLocaleSelect(code: string) {
+    await setLocale(code)
+    setActiveLocale(code)
+  }
+
+  // ── Theme ─────────────────────────────────────────────────────────────────
+  const [activeTheme, setActiveTheme] = useState<ThemeId>(getStoredTheme)
+  const [customThemes, setCustomThemes] = useState<CustomTheme[]>(loadCustomThemes)
+
+  function handleThemeSelect(id: ThemeId) {
+    applyTheme(id)
+    setActiveTheme(id)
+  }
+
+  function handleDeleteCustomTheme(id: string) {
+    deleteCustomTheme(id)
+    setCustomThemes(loadCustomThemes())
+    if (activeTheme === id) {
+      applyTheme('light')
+      setActiveTheme('light')
+    }
+  }
+
+  // ── Add custom theme form ─────────────────────────────────────────────────
+  const [customFormOpen, setCustomFormOpen] = useState(false)
+  const [customName, setCustomName] = useState('')
+  const [customColors, setCustomColors] = useState('')
+  const [customDark, setCustomDark] = useState(false)
+  const [customError, setCustomError] = useState<string | null>(null)
+
+  const parsedPreview = useMemo(() => parseThemeColors(customColors), [customColors])
+
+  function handleAddCustomTheme() {
+    setCustomError(null)
+    if (!customName.trim()) { setCustomError(t`Theme name is required`); return }
+    const vars = parseThemeColors(customColors)
+    if (!vars) { setCustomError(t`Must be exactly 10 comma-separated hex values (e.g. #1E1E2E)`); return }
+    const id = `custom-${Date.now()}`
+    const theme: CustomTheme = { id, label: customName.trim(), dark: customDark, colors: customColors }
+    saveCustomTheme(theme)
+    setCustomThemes(loadCustomThemes())
+    applyTheme(id as ThemeId)
+    setActiveTheme(id as ThemeId)
+    setCustomName('')
+    setCustomColors('')
+    setCustomDark(false)
+    setCustomFormOpen(false)
+  }
+
+  // ── KOSync ────────────────────────────────────────────────────────────────
+  interface KOSyncStatus {
+    linked: boolean
+    synced_documents?: number
+    last_sync?: number | null
+    last_device?: string | null
+  }
+  const [kosyncStatus, setKosyncStatus] = useState<KOSyncStatus | null>(null)
+  const [kosyncPassword, setKosyncPassword] = useState('')
+  const [kosyncSaving, setKosyncSaving] = useState(false)
+  const [kosyncError, setKosyncError] = useState<string | null>(null)
+  const [kosyncSuccess, setKosyncSuccess] = useState(false)
+
+  useEffect(() => {
+    api.get<KOSyncStatus>('/auth/me/kosync').then(setKosyncStatus).catch(() => {})
+  }, [])
+
+  async function handleKosyncRegister(e: React.FormEvent) {
+    e.preventDefault()
+    setKosyncError(null)
+    setKosyncSuccess(false)
+    setKosyncSaving(true)
+    try {
+      await api.post('/auth/me/kosync', { password: kosyncPassword })
+      setKosyncSuccess(true)
+      setKosyncPassword('')
+      const updated = await api.get<KOSyncStatus>('/auth/me/kosync')
+      setKosyncStatus(updated)
+    } catch (err) {
+      setKosyncError(err instanceof Error ? err.message : t`Failed to register`)
+    } finally {
+      setKosyncSaving(false)
+    }
+  }
+
+  // ── API Keys ──────────────────────────────────────────────────────────────
+  const [apiKeys, setApiKeys] = useState<ApiKey[]>([])
+  const [newKeyResult, setNewKeyResult] = useState<string | null>(null)
+  const [keyCreating, setKeyCreating] = useState(false)
+  const [keyRevoking, setKeyRevoking] = useState<number | null>(null)
+  const [pluginDownloading, setPluginDownloading] = useState(false)
+
+  useEffect(() => {
+    api.get<ApiKey[]>('/plugin/api-keys').then(setApiKeys).catch(() => {})
+  }, [])
+
+  async function handleCreateKey() {
+    setKeyCreating(true)
+    setNewKeyResult(null)
+    try {
+      const res = await api.post<{ id: number; label: string; key: string; created_at: string }>(
+        '/plugin/api-keys', { label: 'KOReader Plugin' }
+      )
+      setNewKeyResult(res.key)
+      setApiKeys(prev => [...prev, { id: res.id, label: res.label, key_preview: res.key.slice(0, 8) + '…', created_at: res.created_at, last_used_at: null }])
+    } catch (err) {
+      // ignore
+    } finally {
+      setKeyCreating(false)
+    }
+  }
+
+  async function handleRevokeKey(id: number) {
+    setKeyRevoking(id)
+    try {
+      await api.delete(`/plugin/api-keys/${id}`)
+      setApiKeys(prev => prev.filter(k => k.id !== id))
+      if (newKeyResult) setNewKeyResult(null)
+    } finally {
+      setKeyRevoking(null)
+    }
+  }
+
+  async function handleDownloadPlugin() {
+    setPluginDownloading(true)
+    try {
+      const token = localStorage.getItem('tome_token')
+      const backendOrigin = window.location.port === '5173'
+        ? window.location.origin.replace(':5173', ':8080')
+        : window.location.origin
+      const res = await fetch(`/api/plugin/koreader?server_url=${encodeURIComponent(backendOrigin)}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      if (!res.ok) throw new Error('Download failed')
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'tomesync.koplugin.zip'
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+      const keys = await api.get<ApiKey[]>('/plugin/api-keys')
+      setApiKeys(keys)
+    } finally {
+      setPluginDownloading(false)
+    }
+  }
+
+  // ── OPDS PINs ─────────────────────────────────────────────────────────────
+  const [opdsPins, setOpdsPins] = useState<OpdsPin[]>([])
+  const [newPinResult, setNewPinResult] = useState<string | null>(null)
+  const [pinLabel, setPinLabel] = useState('KOReader')
+  const [pinCreating, setPinCreating] = useState(false)
+  const [pinRevoking, setPinRevoking] = useState<number | null>(null)
+
+  useEffect(() => {
+    api.get<OpdsPin[]>('/opds-pins').then(setOpdsPins).catch(() => {})
+  }, [])
+
+  async function handleCreatePin() {
+    setPinCreating(true)
+    setNewPinResult(null)
+    try {
+      const res = await api.post<{ id: number; label: string; pin: string; pin_preview: string }>(
+        '/opds-pins', { label: pinLabel || 'KOReader' }
+      )
+      setNewPinResult(res.pin)
+      setOpdsPins(prev => [...prev, {
+        id: res.id,
+        label: res.label,
+        pin_preview: res.pin_preview,
+        created_at: new Date().toISOString(),
+        last_used_at: null,
+      }])
+    } catch {
+      // ignore
+    } finally {
+      setPinCreating(false)
+    }
+  }
+
+  async function handleRevokePin(id: number) {
+    setPinRevoking(id)
+    try {
+      await api.delete(`/opds-pins/${id}`)
+      setOpdsPins(prev => prev.filter(p => p.id !== id))
+      if (newPinResult) setNewPinResult(null)
+    } finally {
+      setPinRevoking(null)
+    }
+  }
+
+  // ── Send to Device ────────────────────────────────────────────────────────
+  interface UserDeviceItem { id: number; name: string; email: string; created_at: string }
+  const [smtpConfigured, setSmtpConfigured] = useState<boolean | null>(null)
+  const [devices, setDevices] = useState<UserDeviceItem[]>([])
+  const [newDeviceName, setNewDeviceName] = useState('')
+  const [newDeviceEmail, setNewDeviceEmail] = useState('')
+  const [deviceAdding, setDeviceAdding] = useState(false)
+  const [deviceDeleting, setDeviceDeleting] = useState<number | null>(null)
+  const [deviceError, setDeviceError] = useState<string | null>(null)
+  const [setupGuideOpen, setSetupGuideOpen] = useState(false)
+  // Hardcover sync section hides itself when the server has the feature off
+  const [hardcoverAvailable, setHardcoverAvailable] = useState(true)
+
+  useEffect(() => {
+    api.get<{ configured: boolean }>('/smtp-status').then(r => {
+      setSmtpConfigured(r.configured)
+      if (r.configured) {
+        api.get<UserDeviceItem[]>('/devices').then(setDevices).catch(() => {})
+      }
+    }).catch(() => setSmtpConfigured(false))
+  }, [])
+
+  async function handleAddDevice(e: React.FormEvent) {
+    e.preventDefault()
+    setDeviceError(null)
+    const name = newDeviceName.trim()
+    const email = newDeviceEmail.trim()
+    if (!name || !email) return
+    setDeviceAdding(true)
+    try {
+      const d = await api.post<UserDeviceItem>('/devices', { name, email })
+      setDevices(prev => [...prev, d])
+      setNewDeviceName('')
+      setNewDeviceEmail('')
+    } catch (err) {
+      setDeviceError(err instanceof Error ? err.message : t`Failed to add device`)
+    } finally {
+      setDeviceAdding(false)
+    }
+  }
+
+  async function handleDeleteDevice(id: number) {
+    setDeviceDeleting(id)
+    try {
+      await api.delete(`/devices/${id}`)
+      setDevices(prev => prev.filter(d => d.id !== id))
+    } finally {
+      setDeviceDeleting(null)
+    }
+  }
+
+  // ── API Tokens ────────────────────────────────────────────────────────────
+  const [apiTokens, setApiTokens] = useState<ApiTokenListItem[]>([])
+  const [apiTokensAllUsers, setApiTokensAllUsers] = useState(false)
+  const [apiTokensLoading, setApiTokensLoading] = useState(false)
+  const [tokenNewName, setTokenNewName] = useState('')
+  const [tokenNewScope, setTokenNewScope] = useState<'full' | 'readonly'>('full')
+  const [tokenFormOpen, setTokenFormOpen] = useState(false)
+  const [tokenCreating, setTokenCreating] = useState(false)
+  const [tokenCreateError, setTokenCreateError] = useState<string | null>(null)
+  const [tokenRevealPlaintext, setTokenRevealPlaintext] = useState<string | null>(null)
+  const [tokenCopied, setTokenCopied] = useState(false)
+  const [tokenRevoking, setTokenRevoking] = useState<number | null>(null)
+  useEffect(() => {
+    setApiTokensLoading(true)
+    listTokens(apiTokensAllUsers)
+      .then(setApiTokens)
+      .catch(() => {})
+      .finally(() => setApiTokensLoading(false))
+  }, [apiTokensAllUsers])
+
+  async function handleCreateToken(e: React.FormEvent) {
+    e.preventDefault()
+    const name = tokenNewName.trim()
+    if (!name) return
+    setTokenCreateError(null)
+    setTokenCreating(true)
+    try {
+      const res = await createToken(name, tokenNewScope)
+      setTokenRevealPlaintext(res.token)
+      setTokenNewName('')
+      setTokenNewScope('full')
+      setTokenFormOpen(false)
+      const updated = await listTokens(apiTokensAllUsers)
+      setApiTokens(updated)
+    } catch (err) {
+      setTokenCreateError(err instanceof Error ? err.message : t`Failed to create token`)
+    } finally {
+      setTokenCreating(false)
+    }
+  }
+
+  async function handleRevokeApiToken(id: number) {
+    if (!confirm(t`Revoke this token? Any scripts or tools using it will stop working immediately.`)) return
+    setTokenRevoking(id)
+    try {
+      await revokeToken(id)
+      const updated = await listTokens(apiTokensAllUsers)
+      setApiTokens(updated)
+    } catch {
+      // ignore
+    } finally {
+      setTokenRevoking(null)
+    }
+  }
+
+  function handleCopyToken() {
+    if (!tokenRevealPlaintext) return
+    navigator.clipboard.writeText(tokenRevealPlaintext).then(() => {
+      setTokenCopied(true)
+      setTimeout(() => setTokenCopied(false), 2000)
+    })
+  }
+
+  // ── Export ────────────────────────────────────────────────────────────────
+  const [exporting, setExporting] = useState<'json' | 'csv' | null>(null)
+
+  async function handleExport(format: 'json' | 'csv') {
+    setExporting(format)
+    try {
+      const token = localStorage.getItem('tome_token')
+      const res = await fetch(`/api/books/export?format=${format}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      if (!res.ok) throw new Error('Export failed')
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      const date = new Date().toISOString().slice(0, 10)
+      a.download = `tome-export-${date}.${format}`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } finally {
+      setExporting(null)
+    }
+  }
+
+  // ── Personal backup ───────────────────────────────────────────────────────
+  const [backingUp, setBackingUp] = useState(false)
+
+  async function handleBackup() {
+    setBackingUp(true)
+    try {
+      const token = localStorage.getItem('tome_token')
+      const res = await fetch('/api/auth/me/backup', {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      if (!res.ok) throw new Error('Backup failed')
+      const serverData = await res.json()
+
+      // Merge client-side preferences (theme, view modes, filters) so the
+      // backup is a complete picture of "what makes Tome feel like mine".
+      const clientPreferences: Record<string, string | null> = {}
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i)
+        if (!key || key === 'tome_token') continue
+        if (!key.startsWith('tome_') && !key.startsWith('theme') && !key.startsWith('reader')) continue
+        clientPreferences[key] = localStorage.getItem(key)
+      }
+      const payload = { ...serverData, client_preferences: clientPreferences }
+
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      const date = new Date().toISOString().slice(0, 10)
+      a.download = `tome-backup-${user?.username ?? 'me'}-${date}.json`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } finally {
+      setBackingUp(false)
+    }
+  }
+
+  const origin = window.location.origin
+  const opdsUrl = `${origin}/opds`
+  const kosyncUrl = `${origin}/api/v1`
+
+  return (
+    <div className="min-h-screen bg-background flex flex-col">
+      <header className="border-b border-border bg-card/50 backdrop-blur-sm sticky top-0 z-20 safe-top">
+        <div className="max-w-3xl mx-auto px-4 h-14 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <Link
+              to="/"
+              className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
+            >
+              <ArrowLeft className="w-4 h-4" />
+              <Trans>Library</Trans>
+            </Link>
+            <span className="text-border select-none">/</span>
+            <span className="text-sm font-medium text-foreground"><Trans>Settings</Trans></span>
+          </div>
+          <ThemeToggle />
+        </div>
+      </header>
+
+      <main className="flex-1 max-w-3xl mx-auto w-full px-4 py-10 space-y-10">
+
+        {/* ── Account & Security ────────────────────────────────────────── */}
+        <section>
+          <SectionHeader title={t`Account & Security`} />
+          <div className="mt-4 rounded-xl border border-border bg-card divide-y divide-border overflow-hidden">
+
+            {/* Profile */}
+            <div className="p-5">
+              <form onSubmit={handleProfileSubmit} className="flex flex-col sm:flex-row gap-3 items-start">
+                <div className="flex-1 w-full grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-medium text-muted-foreground mb-1"><Trans>Username</Trans></label>
+                    <input
+                      type="text"
+                      value={profileUsername}
+                      onChange={e => setProfileUsername(e.target.value)}
+                      required
+                      className="w-full text-sm bg-muted rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-ring"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-muted-foreground mb-1"><Trans>Email</Trans></label>
+                    <input
+                      type="email"
+                      value={profileEmail}
+                      onChange={e => setProfileEmail(e.target.value)}
+                      required
+                      className="w-full text-sm bg-muted rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-ring"
+                    />
+                  </div>
+                </div>
+                <button
+                  type="submit"
+                  disabled={profileSaving || !profileChanged}
+                  className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium bg-primary text-primary-foreground hover:opacity-90 transition-all disabled:opacity-40 sm:mt-5 shrink-0"
+                >
+                  {profileSaving && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                  {profileSaving ? t`Saving…` : t`Save changes`}
+                </button>
+              </form>
+              {profileError && <p className="text-xs text-destructive mt-2">{profileError}</p>}
+              {profileSuccess && <p className="text-xs text-success mt-2"><Trans>Profile updated</Trans></p>}
+            </div>
+
+            {/* Password */}
+            <div className="p-5">
+              <p className="text-sm font-medium text-foreground mb-3"><Trans>Change Password</Trans></p>
+              {user?.auth_source === 'oidc' ? (
+                <p className="text-sm text-muted-foreground max-w-sm">
+                  <Trans>You're signed in via SSO. Manage your credentials at your identity
+                  provider — there's no Tome password to change.</Trans>
+                </p>
+              ) : (
+              <form onSubmit={handlePasswordSubmit} className="space-y-3 max-w-sm">
+                <PasswordField
+                  label={t`Current password`}
+                  value={currentPassword}
+                  onChange={setCurrentPassword}
+                  show={showPasswords}
+                  onToggleShow={() => setShowPasswords(v => !v)}
+                  showToggle
+                />
+                <PasswordField label={t`New password`} value={newPassword} onChange={setNewPassword} show={showPasswords} />
+                <PasswordField
+                  label={t`Confirm new password`}
+                  value={confirmPassword}
+                  onChange={setConfirmPassword}
+                  show={showPasswords}
+                  error={!!(pwError && confirmPassword && newPassword !== confirmPassword)}
+                />
+                {pwError && <p className="text-xs text-destructive pt-0.5">{pwError}</p>}
+                {pwSuccess && <p className="text-xs text-success pt-0.5"><Trans>Password updated successfully</Trans></p>}
+                <div className="pt-1">
+                  <button
+                    type="submit"
+                    disabled={pwSaving || !currentPassword || !newPassword || !confirmPassword}
+                    className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium bg-primary text-primary-foreground hover:opacity-90 transition-all disabled:opacity-40"
+                  >
+                    {pwSaving && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                    {pwSaving ? t`Saving…` : t`Update password`}
+                  </button>
+                </div>
+              </form>
+              )}
+            </div>
+
+            {/* SSO linking */}
+            {ssoEnabled && (
+              <div className="p-5">
+                <p className="text-sm font-medium text-foreground mb-3"><Trans>Single Sign-On</Trans></p>
+                {ssoMsg && (
+                  <div className={cn(
+                    'flex items-center gap-2 text-sm p-3 rounded-lg mb-3 border',
+                    ssoMsg.ok
+                      ? 'text-success bg-success/10 border-success/20'
+                      : 'text-destructive bg-destructive/10 border-destructive/20'
+                  )}>
+                    {ssoMsg.ok ? <Check className="w-4 h-4 shrink-0" /> : <AlertTriangle className="w-4 h-4 shrink-0" />}
+                    {ssoMsg.text}
+                  </div>
+                )}
+                {user?.oidc_linked ? (
+                  <p className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <Check className="w-4 h-4 text-success" />
+                    <Trans>Your account is linked to SSO — you can sign in with your identity provider.</Trans>
+                  </p>
+                ) : (
+                  <div className="space-y-3 max-w-sm">
+                    <p className="text-sm text-muted-foreground">
+                      {user?.auth_source === 'oidc'
+                        ? <Trans>Link your identity provider to this account so you can sign in with SSO. Your existing login keeps working.</Trans>
+                        : <Trans>Link your identity provider to this account so you can sign in with SSO. Your existing login and password keep working.</Trans>}
+                    </p>
+                    <button
+                      onClick={handleLinkSso}
+                      disabled={linkingSso}
+                      className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium border border-border text-foreground hover:bg-muted transition-all disabled:opacity-40"
+                    >
+                      {linkingSso ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Key className="w-3.5 h-3.5" />}
+                      <Trans>Link SSO</Trans>
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Quick Connect */}
+            <div className="p-5">
+              <div className="flex items-start gap-3 mb-3">
+                <div className="p-1.5 rounded-lg bg-primary/10 mt-0.5 shrink-0">
+                  <Smartphone className="w-3.5 h-3.5 text-primary" />
+                </div>
+                <div>
+                  <p className="text-sm font-medium text-foreground"><Trans>Quick Connect</Trans></p>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    <Trans>Sign in on a new device without entering your password. Show a QR code for the Tome app, or enter the 6-character code a new device displays when you tap "Quick Connect" on its login screen.</Trans>
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowConnectPhone(true)}
+                className="mb-4 flex items-center gap-1.5 h-9 px-3 rounded-md text-sm font-medium border border-border hover:bg-muted transition-colors"
+              >
+                <QrCode className="w-3.5 h-3.5" />
+                <Trans>Connect a phone</Trans>
+              </button>
+              {showConnectPhone && <ConnectPhoneModal onClose={() => setShowConnectPhone(false)} />}
+              <form onSubmit={handleQcAuthorize} className="flex items-end gap-2 max-w-xs">
+                <div className="flex-1">
+                  <label className="block text-xs font-medium text-muted-foreground mb-1"><Trans>Code from new device</Trans></label>
+                  <input
+                    type="text"
+                    value={qcCode}
+                    onChange={e => setQcCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6))}
+                    placeholder="ABC123"
+                    maxLength={6}
+                    spellCheck={false}
+                    className="w-full h-9 rounded-md border border-border bg-background px-3 text-sm font-mono tracking-widest uppercase focus:outline-none focus:ring-1 focus:ring-ring"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={qcAuthorizing || qcCode.trim().length !== 6}
+                  className="flex items-center gap-1.5 h-9 px-3 rounded-md text-sm font-medium bg-primary text-primary-foreground hover:opacity-90 transition-all disabled:opacity-40 shrink-0"
+                >
+                  {qcAuthorizing && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  {qcAuthorizing ? t`Authorizing...` : t`Authorize`}
+                </button>
+              </form>
+              {qcError && <p className="text-xs text-destructive mt-2">{qcError}</p>}
+              {qcSuccess && (
+                <div className="flex items-center gap-1.5 text-xs text-success mt-2">
+                  <CheckCircle className="w-3.5 h-3.5" />
+                  <Trans>Device authorized — the new device is now signed in.</Trans>
+                </div>
+              )}
+            </div>
+
+          </div>
+        </section>
+
+        {/* ── Appearance ───────────────────────────────────────────────── */}
+        <section>
+          <SectionHeader title={t`Appearance`} />
+
+          {/* Built-in themes — neutral core + warm pair */}
+          {([[t`Core`, 'core'], [t`Warm`, 'warm']] as const).map(([groupLabel, group]) => (
+            <div key={group} className="mt-4">
+              <p className="text-xs text-muted-foreground mb-1.5">{groupLabel}</p>
+              <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
+                {THEMES.filter(t => t.group === group).map(theme => {
+                  const active = activeTheme === theme.id
+                  return (
+                    <button
+                      key={theme.id}
+                      onClick={() => handleThemeSelect(theme.id)}
+                      className={cn(
+                        'group relative rounded-lg overflow-hidden transition-all duration-150',
+                        active
+                          ? 'ring-2 ring-primary ring-offset-2 ring-offset-background shadow-md'
+                          : 'ring-1 ring-border hover:ring-primary/40 hover:shadow-sm'
+                      )}
+                      title={theme.label}
+                    >
+                      <div className="h-10 w-full flex items-end p-1.5 gap-1" style={{ background: theme.preview.bg }}>
+                        <div className="flex-1 h-4 rounded opacity-90" style={{ background: theme.preview.card }} />
+                        <div className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: theme.preview.primary }} />
+                      </div>
+                      <div className="px-1.5 py-1 flex items-center justify-between gap-1" style={{ background: theme.preview.card }}>
+                        <span className="text-[10px] font-medium leading-tight truncate" style={{ color: theme.preview.text }}>
+                          {theme.label}
+                        </span>
+                        {active && <Check className="w-2.5 h-2.5 shrink-0" style={{ color: theme.preview.primary }} />}
+                      </div>
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          ))}
+
+          {/* Custom themes */}
+          {customThemes.length > 0 && (
+            <div className="mt-3 grid grid-cols-3 sm:grid-cols-4 gap-2">
+              {customThemes.map(theme => {
+                const active = activeTheme === theme.id
+                const vars = parseThemeColors(theme.colors)
+                const bg = vars?.['--background'] ?? '#888'
+                const card = vars?.['--card'] ?? '#999'
+                const primary = vars?.['--primary'] ?? '#fff'
+                const text = vars?.['--foreground'] ?? '#fff'
+                return (
+                  <div key={theme.id} className="relative group">
+                    <button
+                      onClick={() => handleThemeSelect(theme.id as ThemeId)}
+                      className={cn(
+                        'w-full rounded-lg overflow-hidden transition-all duration-150',
+                        active
+                          ? 'ring-2 ring-primary ring-offset-2 ring-offset-background shadow-md'
+                          : 'ring-1 ring-border hover:ring-primary/40 hover:shadow-sm'
+                      )}
+                      title={theme.label}
+                    >
+                      <div className="h-10 w-full flex items-end p-1.5 gap-1" style={{ background: bg }}>
+                        <div className="flex-1 h-4 rounded opacity-90" style={{ background: card }} />
+                        <div className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: primary }} />
+                      </div>
+                      <div className="px-1.5 py-1 flex items-center justify-between gap-1" style={{ background: card }}>
+                        <span className="text-[10px] font-medium leading-tight truncate" style={{ color: text }}>
+                          {theme.label}
+                        </span>
+                        {active && <Check className="w-2.5 h-2.5 shrink-0" style={{ color: primary }} />}
+                      </div>
+                    </button>
+                    <button
+                      onClick={() => handleDeleteCustomTheme(theme.id)}
+                      className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-destructive text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm"
+                      title={t`Delete theme`}
+                    >
+                      <X className="w-2.5 h-2.5" />
+                    </button>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+
+          {/* Add custom theme */}
+          <div className="mt-3 rounded-xl border border-border bg-card overflow-hidden">
+            <button
+              onClick={() => setCustomFormOpen(v => !v)}
+              className="w-full flex items-center justify-between px-4 py-3 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+            >
+              <span className="flex items-center gap-2 font-medium">
+                <Plus className="w-3.5 h-3.5" />
+                <Trans>Add custom theme</Trans>
+              </span>
+              {customFormOpen ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+            </button>
+
+            {customFormOpen && (
+              <div className="border-t border-border p-4 space-y-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-medium text-muted-foreground mb-1"><Trans>Theme name</Trans></label>
+                    <input
+                      type="text"
+                      value={customName}
+                      onChange={e => setCustomName(e.target.value)}
+                      placeholder={t`My Theme`}
+                      className="w-full text-sm bg-muted rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-ring"
+                    />
+                  </div>
+                  <div className="flex items-end">
+                    <label className="flex items-center gap-2 text-sm text-foreground cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={customDark}
+                        onChange={e => setCustomDark(e.target.checked)}
+                        className="w-4 h-4 rounded accent-primary"
+                      />
+                      <Trans>Dark theme</Trans>
+                      <span className="text-xs text-muted-foreground"><Trans>(enables dark: variants)</Trans></span>
+                    </label>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-muted-foreground mb-1">
+                    <Trans>Colors <span className="font-normal">(10 hex values, comma-separated)</span></Trans>
+                  </label>
+                  <input
+                    type="text"
+                    value={customColors}
+                    onChange={e => { setCustomColors(e.target.value); setCustomError(null) }}
+                    placeholder="#1E1E2E,#CDD6F4,#313244,#CBA6F7,#1E1E2E,#45475A,#A6ADC8,#313244,#585B70,#F38BA8"
+                    className="w-full text-xs font-mono bg-muted rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-ring"
+                    spellCheck={false}
+                  />
+                  <p className="text-[10px] text-muted-foreground mt-1">
+                    <Trans>Order: background, foreground, card, primary, primary-foreground, muted, muted-foreground, accent, border, destructive</Trans>
+                  </p>
+                </div>
+
+                {/* Live preview */}
+                {parsedPreview && (
+                  <div className="flex items-center gap-3">
+                    <span className="text-xs text-muted-foreground shrink-0"><Trans>Preview:</Trans></span>
+                    <div
+                      className="flex items-center gap-1.5 rounded-lg px-3 py-2 border"
+                      style={{
+                        background: parsedPreview['--background'],
+                        borderColor: parsedPreview['--border'],
+                      }}
+                    >
+                      <div className="w-6 h-6 rounded" style={{ background: parsedPreview['--card'] }} />
+                      <div className="w-4 h-4 rounded-full" style={{ background: parsedPreview['--primary'] }} />
+                      <span className="text-xs font-medium" style={{ color: parsedPreview['--foreground'] }}>
+                        {customName || t`Preview`}
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {customError && <p className="text-xs text-destructive">{customError}</p>}
+
+                <button
+                  onClick={handleAddCustomTheme}
+                  className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-primary text-primary-foreground hover:opacity-90 transition-all"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <Trans>Add Theme</Trans>
+                </button>
+              </div>
+            )}
+          </div>
+
+        </section>
+
+        {/* ── Language ─────────────────────────────────────────────────── */}
+        {/* Pills work up to roughly a dozen locales; if the list outgrows a
+            row or two, swap back to a (styled) select. Labels are the
+            language's own name and stay untranslated on purpose. */}
+        <section>
+          <SectionHeader title={t`Language`} />
+          <div className="mt-4 flex flex-wrap gap-2">
+            {LOCALES.map(l => {
+              const active = activeLocale === l.code
+              return (
+                <button
+                  key={l.code}
+                  onClick={() => handleLocaleSelect(l.code)}
+                  lang={l.code}
+                  className={cn(
+                    'flex items-center gap-2 px-4 py-2 rounded-lg border text-sm transition-all',
+                    active
+                      ? 'border-primary bg-primary/10 text-primary font-medium'
+                      : 'border-border text-muted-foreground hover:text-foreground hover:border-primary/40 hover:bg-muted/50'
+                  )}
+                >
+                  {l.label}
+                  {active && <Check className="w-3.5 h-3.5" />}
+                </button>
+              )
+            })}
+          </div>
+          <p className="text-xs text-muted-foreground mt-3">
+            <Trans>Translations are community-maintained. Anything not yet translated is shown in English.</Trans>
+          </p>
+        </section>
+
+        {/* ── KOReader ─────────────────────────────────────────────────── */}
+        <section>
+          {/* eslint-disable-next-line lingui/no-unlocalized-strings -- product name */}
+          <SectionHeader title="KOReader" />
+          <div className="mt-4 rounded-xl border border-border bg-card overflow-hidden divide-y divide-border">
+
+            {/* OPDS Catalog */}
+            <div className="p-6 space-y-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-0.5"><Trans>OPDS Catalog</Trans></p>
+                  <p className="text-xs text-muted-foreground">
+                    <Trans>Browse and download your library from KOReader or any OPDS client.</Trans>
+                  </p>
+                </div>
+                <a href={docsLink(DOCS.opds)} target="_blank" rel="noopener noreferrer" className="shrink-0 inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-primary transition-colors">
+                  <Trans>Learn more</Trans> <ExternalLink className="w-3 h-3" />
+                </a>
+              </div>
+              <ConnectBlock rows={[
+                { label: t`URL`, value: opdsUrl, copy: true },
+                { label: t`Username`, value: user?.username ?? '—', copy: true },
+                { label: t`Password`, value: t`your Tome password` },
+              ]} />
+              <p className="text-xs text-muted-foreground">
+                <Trans>In KOReader: Search &rarr; OPDS catalog &rarr; add catalog with the URL above.</Trans>
+              </p>
+
+              {/* OPDS PINs — nested under OPDS */}
+              <div className="space-y-2 pt-1">
+                <div className="flex items-center justify-between">
+                  <p className="text-xs font-medium text-muted-foreground flex items-center gap-1.5">
+                    <Key className="w-3 h-3" /> <Trans>App-specific PINs</Trans>
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={pinLabel}
+                      onChange={e => setPinLabel(e.target.value)}
+                      placeholder={t`Label (e.g. KOReader)`}
+                      className="h-7 rounded-md border border-border bg-background px-2 text-xs focus:outline-none focus:ring-1 focus:ring-ring w-36"
+                    />
+                    <button
+                      onClick={handleCreatePin}
+                      disabled={pinCreating}
+                      className="flex items-center gap-1 text-xs text-primary hover:opacity-80 transition-opacity disabled:opacity-50"
+                    >
+                      {pinCreating ? <Loader2 className="w-3 h-3 animate-spin" /> : <Plus className="w-3 h-3" />}
+                      <Trans>Generate PIN</Trans>
+                    </button>
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  <Trans>Short app-specific passwords for OPDS — easier to type on an e-reader than your full password.</Trans>
+                </p>
+
+                {newPinResult && (
+                  <div className="rounded-lg bg-success/10 border border-success/20 p-3 space-y-1">
+                    <p className="text-xs text-success font-medium"><Trans>PIN created — copy it now, it won't be shown again.</Trans></p>
+                    <div className="flex items-center gap-2">
+                      <code className="text-xs font-mono text-foreground break-all flex-1">{newPinResult}</code>
+                      <button
+                        onClick={() => navigator.clipboard.writeText(newPinResult)}
+                        className="p-1 rounded hover:bg-accent transition-colors text-muted-foreground shrink-0"
+                      >
+                        <Copy className="w-3 h-3" />
+                      </button>
+                    </div>
+                    <p className="text-xs text-muted-foreground"><Trans>Use this as the OPDS password in KOReader (username stays the same).</Trans></p>
+                  </div>
+                )}
+
+                {opdsPins.length > 0 ? (
+                  <div className="rounded-lg border border-border overflow-hidden text-xs divide-y divide-border">
+                    {opdsPins.map(p => (
+                      <div key={p.id} className="flex items-center gap-3 px-3 py-2">
+                        <span className="font-mono text-muted-foreground w-14 shrink-0">{p.pin_preview}</span>
+                        <span className="text-foreground flex-1 truncate">{p.label}</span>
+                        <span className="text-muted-foreground hidden sm:block shrink-0">
+                          {(() => { const d = new Date(p.last_used_at ?? 0).toLocaleDateString(i18n.locale); return p.last_used_at ? t`used ${d}` : t`never used` })()}
+                        </span>
+                        <button
+                          onClick={() => handleRevokePin(p.id)}
+                          disabled={pinRevoking === p.id}
+                          className="p-1 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors"
+                          title={t`Revoke`}
+                        >
+                          {pinRevoking === p.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-xs text-muted-foreground"><Trans>No PINs yet. Generate one to use with OPDS clients.</Trans></p>
+                )}
+              </div>
+            </div>
+
+            {/* Progress Sync (KOSync) */}
+            <div className="p-6 space-y-4">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-0.5"><Trans>Progress Sync</Trans></p>
+                  <p className="text-xs text-muted-foreground">
+                    <Trans>Sync reading position between KOReader and Tome.</Trans>
+                  </p>
+                </div>
+                {kosyncStatus?.linked && (
+                  <span className="flex items-center gap-1 text-xs text-success shrink-0 mt-0.5">
+                    <Check className="w-3 h-3" /> <Trans>Linked</Trans>
+                    {kosyncStatus.synced_documents != null && (
+                      <span className="text-muted-foreground ml-1">{(() => { const n = kosyncStatus.synced_documents; return t`· ${n} docs` })()}</span>
+                    )}
+                  </span>
+                )}
+              </div>
+
+              {kosyncStatus?.last_sync && (
+                <p className="text-xs text-muted-foreground">
+                  {(() => { const d = new Date(kosyncStatus.last_sync * 1000).toLocaleString(i18n.locale); return t`Last sync: ${d}` })()}
+                  {kosyncStatus.last_device && ` · ${kosyncStatus.last_device}`}
+                </p>
+              )}
+
+              <form onSubmit={handleKosyncRegister} className="flex items-end gap-2 max-w-xs">
+                <div className="flex-1">
+                  <label className="block text-xs font-medium text-muted-foreground mb-1">
+                    {kosyncStatus?.linked ? t`Update sync password` : t`Set sync password`}
+                  </label>
+                  <input
+                    type="password"
+                    value={kosyncPassword}
+                    onChange={e => setKosyncPassword(e.target.value)}
+                    placeholder="••••••••"
+                    className="w-full h-9 rounded-md border border-border bg-background px-3 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={kosyncSaving || !kosyncPassword}
+                  className="flex items-center gap-1.5 h-9 px-3 rounded-md text-sm font-medium bg-primary text-primary-foreground hover:opacity-90 transition-all disabled:opacity-40 shrink-0"
+                >
+                  {kosyncSaving && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  {kosyncSaving ? t`Saving…` : kosyncStatus?.linked ? t`Update` : t`Register`}
+                </button>
+              </form>
+              {kosyncError && <p className="text-xs text-destructive">{kosyncError}</p>}
+              {kosyncSuccess && <p className="text-xs text-success"><Trans>KOSync registered successfully</Trans></p>}
+
+              <ConnectBlock rows={[
+                { label: t`URL`, value: kosyncUrl, copy: true },
+                { label: t`Username`, value: user?.username ?? '—', copy: true },
+                { label: t`Password`, value: t`the sync password set above` },
+              ]} />
+              <p className="text-xs text-muted-foreground">
+                <Trans>In KOReader: Tools &rarr; Progress sync &rarr; Custom sync server.</Trans>
+              </p>
+            </div>
+
+            {/* TomeSync Plugin */}
+            <div className="p-6 space-y-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-0.5"><Trans>TomeSync Plugin</Trans></p>
+                  <p className="text-xs text-muted-foreground">
+                    <Trans>Native KOReader plugin — tracks reading sessions and syncs by book ID. More reliable than KOSync.</Trans>
+                  </p>
+                </div>
+                <div className="flex items-center gap-3 shrink-0">
+                  <a href={docsLink(DOCS.koreader)} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-primary transition-colors">
+                    <Trans>Learn more</Trans> <ExternalLink className="w-3 h-3" />
+                  </a>
+                  <PluginVersion />
+                </div>
+              </div>
+
+              <button
+                onClick={handleDownloadPlugin}
+                disabled={pluginDownloading}
+                className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-primary text-primary-foreground hover:opacity-90 transition-all disabled:opacity-50"
+              >
+                {pluginDownloading
+                  ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  : <Download className="w-3.5 h-3.5" />
+                }
+                {pluginDownloading ? t`Preparing…` : t`Download plugin ZIP`}
+              </button>
+
+              <SetupGuide />
+
+              {/* API Keys */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <p className="text-xs font-medium text-muted-foreground flex items-center gap-1.5">
+                    <Key className="w-3 h-3" /> <Trans>API Keys</Trans>
+                  </p>
+                  <button
+                    onClick={handleCreateKey}
+                    disabled={keyCreating}
+                    className="flex items-center gap-1 text-xs text-primary hover:opacity-80 transition-opacity disabled:opacity-50"
+                  >
+                    {keyCreating ? <Loader2 className="w-3 h-3 animate-spin" /> : <Plus className="w-3 h-3" />}
+                    <Trans>New key</Trans>
+                  </button>
+                </div>
+
+                {newKeyResult && (
+                  <div className="rounded-lg bg-success/10 border border-success/20 p-3 space-y-1">
+                    <p className="text-xs text-success font-medium"><Trans>Key created — copy it now, it won't be shown again.</Trans></p>
+                    <div className="flex items-center gap-2">
+                      <code className="text-xs font-mono text-foreground break-all flex-1">{newKeyResult}</code>
+                      <button onClick={() => navigator.clipboard.writeText(newKeyResult)}
+                        className="p-1 rounded hover:bg-accent transition-colors text-muted-foreground shrink-0">
+                        <Copy className="w-3 h-3" />
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {apiKeys.length > 0 ? (
+                  <div className="rounded-lg border border-border overflow-hidden text-xs divide-y divide-border">
+                    {apiKeys.map(k => (
+                      <div key={k.id} className="flex items-center gap-3 px-3 py-2">
+                        <span className="font-mono text-muted-foreground flex-1">{k.key_preview}</span>
+                        <span className="text-muted-foreground hidden sm:block">
+                          {(() => { const d = new Date(k.last_used_at ?? 0).toLocaleDateString(i18n.locale); return k.last_used_at ? t`used ${d}` : t`never used` })()}
+                        </span>
+                        <button
+                          onClick={() => handleRevokeKey(k.id)}
+                          disabled={keyRevoking === k.id}
+                          className="p-1 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors"
+                          title={t`Revoke`}
+                        >
+                          {keyRevoking === k.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-xs text-muted-foreground"><Trans>No API keys. Download the plugin to auto-create one.</Trans></p>
+                )}
+              </div>
+            </div>
+
+          </div>
+        </section>
+
+        {/* ── Send to Device ──────────────────────────────────────────── */}
+        <section>
+          <SectionHeader title={t`Send to Device`} />
+          <div className="mt-4 rounded-xl border border-border bg-card overflow-hidden">
+            <div className="p-5 space-y-4">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-3">
+                  <div className="p-1.5 rounded-lg bg-primary/10 mt-0.5 shrink-0">
+                    <Send className="w-3.5 h-3.5 text-primary" />
+                  </div>
+                  <div>
+                    <p className="text-sm font-medium text-foreground"><Trans>E-Reader Devices</Trans></p>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      <Trans>Add your e-reader or personal email. Books are sent as attachments — works with Kindle, Kobo, or any email address.</Trans>
+                    </p>
+                  </div>
+                </div>
+                <a href={docsLink(DOCS.sendToDevice)} target="_blank" rel="noopener noreferrer" className="shrink-0 inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-primary transition-colors">
+                  <Trans>Learn more</Trans> <ExternalLink className="w-3 h-3" />
+                </a>
+              </div>
+
+              {smtpConfigured === false ? (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-2 rounded-lg bg-warning/10 border border-warning/20 px-3 py-2">
+                    <AlertTriangle className="w-3.5 h-3.5 text-warning dark:text-warning shrink-0" />
+                    <p className="text-xs text-warning font-medium"><Trans>Email delivery is not set up yet.</Trans></p>
+                  </div>
+                  <div className="rounded-lg border border-border overflow-hidden text-xs">
+                    <button
+                      onClick={() => setSetupGuideOpen(v => !v)}
+                      className="w-full flex items-center justify-between px-3 py-2.5 text-left hover:bg-accent/50 transition-colors"
+                    >
+                      <span className="font-medium text-foreground"><Trans>How to set it up</Trans></span>
+                      {setupGuideOpen ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" /> : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
+                    </button>
+                    {setupGuideOpen && (
+                      <div className="border-t border-border px-3 py-3 space-y-3 text-xs text-muted-foreground">
+                        <p><Trans>Your server admin needs to set SMTP environment variables:</Trans></p>
+                        <div className="space-y-2">
+                          {/* eslint-disable-next-line lingui/no-unlocalized-strings -- product name */}
+                          <p className="font-medium text-foreground">Gmail</p>
+                          {/* eslint-disable-next-line lingui/no-unlocalized-strings -- env config example */}
+                          <code className="block bg-muted rounded px-2 py-1.5 text-[11px] font-mono whitespace-pre-wrap">TOME_SMTP_HOST=smtp.gmail.com{'\n'}TOME_SMTP_PORT=587{'\n'}TOME_SMTP_USER=you@gmail.com{'\n'}TOME_SMTP_PASSWORD=your-app-password</code>
+                          <p><Trans>Use a <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">Google App Password</a>, not your regular password.</Trans></p>
+                        </div>
+                        <div className="space-y-2">
+                          {/* eslint-disable-next-line lingui/no-unlocalized-strings -- product name */}
+                          <p className="font-medium text-foreground">Fastmail</p>
+                          {/* eslint-disable-next-line lingui/no-unlocalized-strings -- env config example */}
+                          <code className="block bg-muted rounded px-2 py-1.5 text-[11px] font-mono whitespace-pre-wrap">TOME_SMTP_HOST=smtp.fastmail.com{'\n'}TOME_SMTP_PORT=587{'\n'}TOME_SMTP_USER=you@fastmail.com{'\n'}TOME_SMTP_PASSWORD=your-app-password</code>
+                        </div>
+                        <div className="space-y-2">
+                          <p className="font-medium text-foreground"><Trans>Other providers</Trans></p>
+                          <p><Trans>Set <code className="text-foreground">TOME_SMTP_HOST</code>, <code className="text-foreground">TOME_SMTP_PORT</code>, <code className="text-foreground">TOME_SMTP_USER</code>, and <code className="text-foreground">TOME_SMTP_PASSWORD</code>.</Trans></p>
+                        </div>
+                        <div className="rounded-lg bg-muted/60 border border-border p-2.5">
+                          <p className="font-medium text-foreground mb-1"><Trans>Kindle users</Trans></p>
+                          <p><Trans>Add your SMTP sender address to Amazon's <a href="https://www.amazon.com/hz/mycd/myx#/home/settings/payment" target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">Approved Personal Document E-mail List</a>, or emails will be silently dropped.</Trans></p>
+                        </div>
+                        <p className="text-muted-foreground/70"><Trans>Ask your server admin if you don't manage the Tome installation yourself.</Trans></p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : smtpConfigured ? (
+                <div className="space-y-3">
+                  {/* Add device form */}
+                  <form onSubmit={handleAddDevice} className="flex items-end gap-2">
+                    <div className="flex-1">
+                      <label className="block text-xs font-medium text-muted-foreground mb-1"><Trans>Device name</Trans></label>
+                      <input
+                        type="text"
+                        value={newDeviceName}
+                        onChange={e => setNewDeviceName(e.target.value)}
+                        placeholder={t`My Kindle`}
+                        className="w-full h-9 rounded-md border border-border bg-background px-3 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+                      />
+                    </div>
+                    <div className="flex-1">
+                      <label className="block text-xs font-medium text-muted-foreground mb-1"><Trans>Email address</Trans></label>
+                      <input
+                        type="email"
+                        value={newDeviceEmail}
+                        onChange={e => setNewDeviceEmail(e.target.value)}
+                        placeholder="user_abc@kindle.com"
+                        className="w-full h-9 rounded-md border border-border bg-background px-3 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      disabled={deviceAdding || !newDeviceName.trim() || !newDeviceEmail.trim()}
+                      className="flex items-center gap-1.5 h-9 px-3 rounded-md text-sm font-medium bg-primary text-primary-foreground hover:opacity-90 transition-all disabled:opacity-40 shrink-0"
+                    >
+                      {deviceAdding ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+                      <Trans>Add</Trans>
+                    </button>
+                  </form>
+                  {deviceError && <p className="text-xs text-destructive">{deviceError}</p>}
+
+                  {/* Device list */}
+                  {devices.length > 0 ? (
+                    <div className="rounded-lg border border-border overflow-hidden text-xs divide-y divide-border">
+                      {devices.map(d => (
+                        <div key={d.id} className="flex items-center gap-3 px-3 py-2">
+                          <Send className="w-3 h-3 text-muted-foreground shrink-0" />
+                          <span className="text-foreground font-medium flex-1 truncate">{d.name}</span>
+                          <span className="text-muted-foreground hidden sm:block truncate max-w-48">{d.email}</span>
+                          <button
+                            onClick={() => handleDeleteDevice(d.id)}
+                            disabled={deviceDeleting === d.id}
+                            className="p-1 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors"
+                            title={t`Remove device`}
+                          >
+                            {deviceDeleting === d.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Trash2 className="w-3 h-3" />}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-muted-foreground"><Trans>No devices yet. Add one to start sending books.</Trans></p>
+                  )}
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </section>
+
+        {/* ── Hardcover ────────────────────────────────────────────────── */}
+        {hardcoverAvailable && (
+          <section>
+            {/* eslint-disable-next-line lingui/no-unlocalized-strings -- product name */}
+            <SectionHeader title="Hardcover" />
+            <HardcoverSync onAvailable={setHardcoverAvailable} />
+          </section>
+        )}
+
+        {/* ── API Tokens ───────────────────────────────────────────────── */}
+        <section>
+          <SectionHeader title={t`API Tokens`} />
+          <div className="mt-4 rounded-xl border border-border bg-card overflow-hidden">
+            <div className="p-5 space-y-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-xs text-muted-foreground">
+                    <Trans>Long-lived tokens for scripts and tools (e.g. Scribe). Each token is shown once on creation.</Trans>{' '}
+                    <a href={docsLink(DOCS.apiTokens)} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-0.5 text-foreground/80 hover:text-primary transition-colors">
+                      <Trans>Learn more</Trans> <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  {user?.is_admin && apiTokens.length > 0 && (
+                    <label className="flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={apiTokensAllUsers}
+                        onChange={e => setApiTokensAllUsers(e.target.checked)}
+                        className="w-3.5 h-3.5 rounded accent-primary"
+                      />
+                      <Trans>All users</Trans>
+                    </label>
+                  )}
+                  <button
+                    onClick={() => { setTokenFormOpen(v => !v); setTokenCreateError(null) }}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-primary text-primary-foreground hover:opacity-90 transition-all"
+                  >
+                    <Plus className="w-3 h-3" />
+                    <Trans>New Token</Trans>
+                  </button>
+                </div>
+              </div>
+
+              {/* Create form */}
+              {tokenFormOpen && (
+                <form onSubmit={handleCreateToken} className="flex items-end gap-2 rounded-lg bg-muted/50 border border-border p-3">
+                  <div className="flex-1">
+                    <label className="block text-xs font-medium text-muted-foreground mb-1"><Trans>Token name</Trans></label>
+                    <input
+                      type="text"
+                      value={tokenNewName}
+                      onChange={e => { setTokenNewName(e.target.value); setTokenCreateError(null) }}
+                      placeholder={t`e.g. scribe-laptop`}
+                      autoFocus
+                      className="w-full h-9 rounded-md border border-border bg-background px-3 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+                    />
+                  </div>
+                  <div className="shrink-0">
+                    <label className="block text-xs font-medium text-muted-foreground mb-1"><Trans>Scope</Trans></label>
+                    <select
+                      value={tokenNewScope}
+                      onChange={e => setTokenNewScope(e.target.value as 'full' | 'readonly')}
+                      className="h-9 rounded-md border border-border bg-background px-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+                    >
+                      <option value="full">{t`Full access`}</option>
+                      <option value="readonly">{t`Read-only`}</option>
+                    </select>
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={tokenCreating || !tokenNewName.trim()}
+                    className="flex items-center gap-1.5 h-9 px-3 rounded-md text-sm font-medium bg-primary text-primary-foreground hover:opacity-90 transition-all disabled:opacity-40 shrink-0"
+                  >
+                    {tokenCreating && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                    {tokenCreating ? t`Creating...` : t`Create`}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setTokenFormOpen(false); setTokenNewName(''); setTokenCreateError(null) }}
+                    className="flex items-center h-9 px-3 rounded-md text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-muted transition-colors shrink-0"
+                  >
+                    <Trans>Cancel</Trans>
+                  </button>
+                </form>
+              )}
+              {tokenCreateError && <p className="text-xs text-destructive">{tokenCreateError}</p>}
+
+              {/* One-time token reveal */}
+              {tokenRevealPlaintext && (
+                <div className="rounded-lg bg-warning/10 border border-warning/30 p-4 space-y-3">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-warning dark:text-warning shrink-0 mt-0.5" />
+                    <p className="text-xs font-medium text-warning">
+                      <Trans>This is the only time you will see this token. Store it somewhere safe — it cannot be recovered.</Trans>
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 rounded-md bg-background border border-border px-3 py-2">
+                    <code className="text-xs font-mono text-foreground break-all flex-1 select-all">
+                      {tokenRevealPlaintext}
+                    </code>
+                    <button
+                      onClick={handleCopyToken}
+                      className="p-1.5 rounded hover:bg-accent transition-colors text-muted-foreground hover:text-foreground shrink-0"
+                      title={t`Copy token`}
+                    >
+                      {tokenCopied ? <Check className="w-3.5 h-3.5 text-success" /> : <Copy className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+                  <button
+                    onClick={() => { setTokenRevealPlaintext(null); setTokenCopied(false) }}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-primary text-primary-foreground hover:opacity-90 transition-all"
+                  >
+                    <Trans>Done</Trans>
+                  </button>
+                </div>
+              )}
+
+              {/* Token list */}
+              {apiTokensLoading ? (
+                <div className="flex items-center gap-2 text-xs text-muted-foreground py-2">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <Trans>Loading…</Trans>
+                </div>
+              ) : apiTokens.length === 0 ? (
+                <p className="text-xs text-muted-foreground py-2">
+                  <Trans>No API tokens yet. Create one to use Scribe or scripts against Tome.</Trans>
+                </p>
+              ) : (
+                <div className="rounded-lg border border-border overflow-hidden text-xs divide-y divide-border">
+                  {/* Header */}
+                  <div className={cn(
+                    'hidden sm:grid px-3 py-2 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground bg-muted/40',
+                    apiTokensAllUsers && user?.is_admin ? 'grid-cols-[1fr_7rem_7rem_6rem_3rem_2rem]' : 'grid-cols-[1fr_7rem_7rem_6rem_2rem]'
+                  )}>
+                    <span><Trans>Name</Trans></span>
+                    <span><Trans>Prefix</Trans></span>
+                    <span><Trans>Last used</Trans></span>
+                    <span><Trans>Created</Trans></span>
+                    {apiTokensAllUsers && user?.is_admin && <span><Trans>Owner</Trans></span>}
+                    <span />
+                  </div>
+                  {apiTokens.map(tok => {
+                    const isRevoked = tok.revoked_at !== null
+                    return (
+                      <div
+                        key={tok.id}
+                        className={cn(
+                          'flex sm:grid items-center gap-2 sm:gap-0 px-3 py-2.5 transition-colors',
+                          apiTokensAllUsers && user?.is_admin ? 'sm:grid-cols-[1fr_7rem_7rem_6rem_3rem_2rem]' : 'sm:grid-cols-[1fr_7rem_7rem_6rem_2rem]',
+                          isRevoked ? 'opacity-50' : 'hover:bg-muted/30'
+                        )}
+                      >
+                        <span className="flex items-center gap-1.5 font-medium text-foreground flex-1 truncate min-w-0">
+                          {tok.name}
+                          {(tok.scope ?? 'full') === 'readonly' && (
+                            <span className="shrink-0 px-1 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wide bg-info/10 text-info border border-info/20">
+                              <Trans>Read-only</Trans>
+                            </span>
+                          )}
+                          {isRevoked && (
+                            <span className="shrink-0 px-1 py-0.5 rounded text-[9px] font-semibold uppercase tracking-wide bg-muted text-muted-foreground border border-border">
+                              <Trans>Revoked</Trans>
+                            </span>
+                          )}
+                        </span>
+                        <span className="font-mono text-muted-foreground shrink-0">
+                          tome_{tok.prefix}…
+                        </span>
+                        <span className="text-muted-foreground hidden sm:block shrink-0">
+                          {tok.last_used_at ? relativeTime(tok.last_used_at) : t`Never`}
+                        </span>
+                        <span className="text-muted-foreground hidden sm:block shrink-0">
+                          {new Date(tok.created_at).toLocaleDateString(i18n.locale)}
+                        </span>
+                        {apiTokensAllUsers && user?.is_admin && (
+                          <span className="text-muted-foreground hidden sm:block shrink-0 truncate">
+                            {tok.username}
+                          </span>
+                        )}
+                        <div className="flex items-center justify-end shrink-0">
+                          {!isRevoked && (
+                            <button
+                              onClick={() => handleRevokeApiToken(tok.id)}
+                              disabled={tokenRevoking === tok.id}
+                              className="p-1 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors"
+                              title={t`Revoke token`}
+                            >
+                              {tokenRevoking === tok.id
+                                ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                : <Trash2 className="w-3.5 h-3.5" />
+                              }
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+
+        {/* ── Export ───────────────────────────────────────────────────── */}
+        {/* ── Outbound notifications ────────────────────────────────────── */}
+        <section>
+          <SectionHeader title={t`Notifications`} subtle />
+          <NotificationChannels />
+        </section>
+
+        {/* ── Share links overview ──────────────────────────────────────── */}
+        <section>
+          <SectionHeader title={t`Share links`} subtle />
+          <ShareLinksOverview />
+        </section>
+
+        {/* ── Reading-history import ────────────────────────────────────── */}
+        <section>
+          <SectionHeader title={t`Import reading history`} subtle />
+          <ReadingImport />
+        </section>
+
+        <section>
+          <SectionHeader title={t`Export`} subtle />
+          <div className="mt-3 rounded-xl border border-border/60 bg-card/50 p-5">
+            <p className="text-xs text-muted-foreground mb-4">
+              <Trans>Download your entire library catalog — all titles, authors, series, tags and formats.</Trans>
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <ExportButton format="json" label="JSON" exporting={exporting} onExport={handleExport} />
+              <ExportButton format="csv" label="CSV" exporting={exporting} onExport={handleExport} />
+            </div>
+          </div>
+        </section>
+
+        {/* ── Personal backup ─────────────────────────────────────────── */}
+        <section>
+          <SectionHeader title={t`Backup`} subtle />
+          <div className="mt-3 rounded-xl border border-border/60 bg-card/50 p-5">
+            <p className="text-xs text-muted-foreground mb-4">
+              <Trans>Download a JSON snapshot of <strong>your personal data</strong>: reading status,
+              every reading session, sync positions, shelves, and your local preferences.
+              Book files themselves are not included — Tome only references them on disk.
+              API tokens and KOReader keys are also excluded so the file isn't a credential.</Trans>
+            </p>
+            <button
+              onClick={handleBackup}
+              disabled={backingUp}
+              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium border border-border bg-card hover:bg-muted disabled:opacity-60 disabled:cursor-not-allowed transition-all touch-feedback"
+            >
+              {backingUp ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+              {backingUp ? t`Preparing…` : t`Download my data`}
+            </button>
+          </div>
+        </section>
+
+        {/* ── About ────────────────────────────────────────────────────── */}
+        <section>
+          <SectionHeader title={t`About`} subtle />
+          <div className="mt-3 rounded-xl border border-border/60 bg-card/50 p-5">
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex items-center gap-2.5">
+                <Info className="w-4 h-4 text-muted-foreground" />
+                <span className="text-sm font-semibold text-foreground">Tome</span>
+                <span className="rounded-md border border-border bg-muted px-2 py-0.5 font-mono text-xs text-muted-foreground">
+                  v{tomeVersion}
+                </span>
+              </div>
+              <div className="ml-auto flex items-center gap-2">
+                {updateInfo && (
+                  <a
+                    href={updateInfo.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground transition-all hover:bg-primary/90"
+                  >
+                    <ArrowUpCircle className="w-3.5 h-3.5" />
+                    {(() => { const v = updateInfo.latest; return t`Update to v${v}` })()}
+                  </a>
+                )}
+                <a
+                  href="https://github.com/bndct-devops/tome"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-muted-foreground transition-all hover:bg-muted hover:text-foreground"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  GitHub
+                </a>
+              </div>
+            </div>
+            {updateInfo && (
+              <p className="mt-3 text-xs text-muted-foreground">
+                <Trans>A newer release is available — the link opens the release notes.
+                Update by pulling the new image and restarting the container.</Trans>
+              </p>
+            )}
+          </div>
+        </section>
+
+      </main>
+    </div>
+  )
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function relativeTime(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime()
+  const seconds = Math.floor(diff / 1000)
+  if (seconds < 60) return t`Just now`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return t`${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return t`${hours}h ago`
+  const days = Math.floor(hours / 24)
+  if (days < 30) return t`${days}d ago`
+  return new Date(iso).toLocaleDateString()
+}
+
+// ── Sub-components ────────────────────────────────────────────────────────────
+
+function SectionHeader({ title, subtle = false }: { title: string; subtle?: boolean }) {
+  return (
+    <div className="flex items-center gap-3">
+      <h2 className={cn(
+        'font-display text-base font-normal',
+        subtle ? 'text-muted-foreground' : 'text-foreground'
+      )}>
+        {title}
+      </h2>
+      <div className={cn('flex-1 h-px', subtle ? 'bg-border/50' : 'bg-border')} />
+    </div>
+  )
+}
+
+function ConnectBlock({ rows }: { rows: { label: string; value: string; copy?: boolean }[] }) {
+  const [copied, setCopied] = useState<string | null>(null)
+  function copyValue(value: string) {
+    navigator.clipboard.writeText(value).then(() => {
+      setCopied(value)
+      setTimeout(() => setCopied(null), 1500)
+    })
+  }
+  return (
+    <div className="rounded-lg bg-muted/60 border border-border overflow-hidden text-xs">
+      {rows.map(({ label, value, copy }, i) => (
+        <div key={i} className={cn('flex items-center gap-3 px-3 py-2', i > 0 && 'border-t border-border/50')}>
+          <span className="text-muted-foreground w-20 shrink-0">{label}</span>
+          <span className={cn('flex-1 truncate', copy ? 'font-mono text-foreground' : 'text-muted-foreground')}>{value}</span>
+          {copy && (
+            <button
+              onClick={() => copyValue(value)}
+              className="p-1 rounded hover:bg-accent transition-colors text-muted-foreground hover:text-foreground shrink-0"
+              title={t`Copy`}
+            >
+              {copied === value ? <Check className="w-3 h-3 text-success" /> : <Copy className="w-3 h-3" />}
+            </button>
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function PasswordField({
+  label, value, onChange, show, onToggleShow, showToggle = false, error = false,
+}: {
+  label: string
+  value: string
+  onChange: (v: string) => void
+  show: boolean
+  onToggleShow?: () => void
+  showToggle?: boolean
+  error?: boolean
+}) {
+  return (
+    <div>
+      <label className="block text-xs font-medium text-muted-foreground mb-1">{label}</label>
+      <div className="relative">
+        <input
+          type={show ? 'text' : 'password'}
+          value={value}
+          onChange={e => onChange(e.target.value)}
+          required
+          className={cn(
+            'w-full text-sm bg-muted rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-ring',
+            error && 'ring-2 ring-destructive'
+          )}
+        />
+        {showToggle && onToggleShow && (
+          <button
+            type="button"
+            onClick={onToggleShow}
+            className="absolute right-0.5 top-1/2 -translate-y-1/2 p-2.5 text-muted-foreground hover:text-foreground transition-colors"
+            tabIndex={-1}
+          >
+            {show ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function PluginVersion() {
+  const [label, setLabel] = useState<string | null>(null)
+  useEffect(() => {
+    api.get<{ version: string; build?: number; semver?: string }>('/plugin/version')
+      // eslint-disable-next-line lingui/no-unlocalized-strings -- version identifier
+      .then(r => setLabel(r.semver ? `v${r.semver} (build ${r.build ?? r.version})` : `v${r.version}`))
+      .catch(() => {})
+  }, [])
+  if (!label) return null
+  return (
+    <span className="text-[10px] font-mono text-muted-foreground bg-muted px-1.5 py-0.5 rounded shrink-0">
+      {label}
+    </span>
+  )
+}
+
+const SETUP_STEPS: { title: MessageDescriptor; body: MessageDescriptor; mono?: string }[] = [
+  {
+    title: msg`Download the plugin`,
+    body: msg`Click "Download plugin ZIP" above. An API key is automatically created and baked into the plugin — no manual configuration needed.`,
+  },
+  {
+    title: msg`Copy to KOReader`,
+    body: msg`Unzip the file and copy via SSH (or USB). Remove the old plugin first to ensure a clean install.`,
+    // eslint-disable-next-line lingui/no-unlocalized-strings -- shell command
+    mono: 'ssh root@<kindle-ip> "rm -rf /mnt/us/koreader/plugins/tomesync.koplugin" && scp -r tomesync.koplugin root@<kindle-ip>:/mnt/us/koreader/plugins/',
+  },
+  {
+    title: msg`Restart KOReader`,
+    body: msg`In KOReader: Settings > Device > Restart KOReader. The plugin loads automatically.`,
+  },
+  {
+    title: msg`Open a book downloaded via OPDS`,
+    body: msg`Books downloaded through the OPDS catalog are automatically mapped to their Tome book ID. Open one and TomeSync will start tracking your session immediately.`,
+  },
+  {
+    title: msg`Verify it's working`,
+    body: msg`In KOReader: main menu -> TomeSync -> "Test connection" to confirm the plugin can reach your Tome server.`,
+  },
+  {
+    title: msg`Note on KOSync coexistence`,
+    body: msg`TomeSync and KOSync can both be active. TomeSync tracks full reading sessions; KOSync only stores your last position.`,
+  },
+]
+
+function SetupGuide() {
+  const { i18n } = useLingui()
+  const [open, setOpen] = useState(false)
+
+  return (
+    <div className="rounded-lg border border-border overflow-hidden text-xs">
+      <button
+        onClick={() => setOpen(v => !v)}
+        className="w-full flex items-center justify-between px-3 py-2.5 text-left hover:bg-accent/50 transition-colors"
+      >
+        <span className="font-medium text-foreground"><Trans>Setup instructions</Trans></span>
+        <span className="text-muted-foreground text-[10px]">{open ? '▲' : '▼'}</span>
+      </button>
+      {open && (
+        <ol className="divide-y divide-border border-t border-border">
+          {SETUP_STEPS.map((step, i) => (
+            <li key={i} className="flex gap-3 px-3 py-3">
+              <span className="w-5 h-5 rounded-full bg-primary/10 text-primary font-bold flex items-center justify-center shrink-0 text-[10px] mt-0.5">
+                {i + 1}
+              </span>
+              <div className="space-y-1">
+                <p className="font-medium text-foreground">{i18n._(step.title)}</p>
+                <p className="text-muted-foreground leading-relaxed">{i18n._(step.body)}</p>
+                {step.mono && (
+                  <p className="font-mono text-muted-foreground/70">{step.mono}</p>
+                )}
+              </div>
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  )
+}
+
+function ExportButton({ format, label, exporting, onExport }: {
+  format: 'json' | 'csv'
+  label: string
+  exporting: 'json' | 'csv' | null
+  onExport: (f: 'json' | 'csv') => void
+}) {
+  const { t } = useLingui()
+  const busy = exporting === format
+  return (
+    <button
+      onClick={() => onExport(format)}
+      disabled={exporting !== null}
+      className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium border border-border bg-card hover:bg-muted transition-all disabled:opacity-50"
+    >
+      {busy
+        ? <RefreshCw className="w-3 h-3 animate-spin" />
+        : <Download className="w-3 h-3 text-muted-foreground" />
+      }
+      {busy ? t`Exporting...` : t`Export ${label}`}
+    </button>
+  )
+}

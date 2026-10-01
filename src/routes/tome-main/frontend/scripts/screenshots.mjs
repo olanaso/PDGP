@@ -1,0 +1,1136 @@
+// Regenerate the screenshots in docs/screenshots/ by driving a real browser
+// against a running Tome (frontend + backend).
+//
+// Usage:
+//   ./dev.sh                       # in another terminal
+//   TOME_SCREENSHOT_PASS=... node scripts/screenshots.mjs
+//
+// Environment:
+//   TOME_SCREENSHOT_BASE   Frontend URL    (default http://localhost:5173)
+//   TOME_SCREENSHOT_API    Backend URL     (default http://localhost:8080)
+//   TOME_SCREENSHOT_USER   Admin username  (default benedict)
+//   TOME_SCREENSHOT_PASS   Admin password  (REQUIRED)
+//   TOME_SCREENSHOT_ONLY   Comma-separated shot names to capture (default: all)
+//
+// Each shot lives in SHOTS below: name → path / viewport / optional waitFor.
+// New routes? Add a row. PNGs land in docs/screenshots/.
+import { chromium, devices } from 'playwright'
+import { mkdir } from 'node:fs/promises'
+import path from 'node:path'
+
+// --showcase flag flips defaults to the showcase stack on :5174/:8090
+const SHOWCASE = process.argv.includes('--showcase')
+const BASE = process.env.TOME_SCREENSHOT_BASE ?? (SHOWCASE ? 'http://localhost:5174' : 'http://localhost:5173')
+const API = process.env.TOME_SCREENSHOT_API ?? (SHOWCASE ? 'http://localhost:8090' : 'http://localhost:8080')
+const USER = process.env.TOME_SCREENSHOT_USER ?? 'benedict'
+const PASS = process.env.TOME_SCREENSHOT_PASS ?? (SHOWCASE ? 'showcase' : undefined)
+const TOKEN = process.env.TOME_SCREENSHOT_TOKEN  // Skip /login; use this token directly.
+const ONLY = process.env.TOME_SCREENSHOT_ONLY?.split(',').map(s => s.trim())
+const THEME = process.env.TOME_SCREENSHOT_THEME  // 'light' | 'dark' | 'amber' — overrides per-shot
+// Always write to the repo's docs/screenshots/, regardless of cwd.
+const __dir = path.dirname(new URL(import.meta.url).pathname)
+const OUT = path.resolve(__dir, '../../docs/screenshots')
+
+// A curated stats dashboard injected into localStorage so the gallery-only tiles
+// (Words Read, Reading Speed, Book Length, Re-reads) are on their boards for the
+// shots. localStorage wins over the server copy (huge savedAt), which also stops
+// the two-layer-persistence clobber that otherwise wipes them on page load.
+const DASHBOARD_FILE = process.env.TOME_SCREENSHOT_DASHBOARD ?? (SHOWCASE ? path.join(__dir, '.showcase-board.json') : null)
+let DASHBOARD = null
+if (DASHBOARD_FILE) {
+  try { DASHBOARD = (await import('node:fs')).readFileSync(DASHBOARD_FILE, 'utf8') } catch { /* no board file */ }
+}
+
+if (!PASS && !TOKEN) {
+  console.error('Set TOME_SCREENSHOT_PASS (admin password) OR TOME_SCREENSHOT_TOKEN (existing JWT/API token).')
+  process.exit(1)
+}
+
+const DESKTOP = { width: 1600, height: 1000, deviceScaleFactor: 2 }
+const MOBILE = devices['iPhone 13']  // 390×844, scale 3, mobile UA, touch
+
+// Populated at startup via the API — book IDs shift across re-seeds so we
+// can't hardcode them. See `resolveBookIds()`.
+const bookIds = {}
+
+// ── Wishlist demo state (set SHOT_TOKEN in main() after login) ────────────────
+let SHOT_TOKEN = null
+// Document hash pushed for the kosync-link shot; linked away in its cleanup.
+let KOSYNC_SHOT_DOC = null
+async function wapi(pathname, opts = {}) {
+  return fetch(`${API}${pathname}`, {
+    ...opts,
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${SHOT_TOKEN}`, ...(opts.headers || {}) },
+  })
+}
+async function clearWishes() {
+  const r = await wapi('/api/wishlist').catch(() => null)
+  const list = r ? await r.json().catch(() => []) : []
+  for (const w of (Array.isArray(list) ? list : [])) {
+    await wapi(`/api/wishlist/${w.id}`, { method: 'DELETE' }).catch(() => {})
+  }
+}
+async function seedDemoWishes() {
+  await clearWishes()
+  // Seed from the real search endpoints (like a user does) so covers come through.
+  // Single-book wish: Hitchhiker's Guide via book search (skip the M.J. Simpson
+  // companion book — pick the Douglas Adams novel).
+  try {
+    const r = await wapi(`/api/wishlist/search?q=${encodeURIComponent("the hitchhiker's guide to the galaxy")}`)
+    const cands = await r.json().catch(() => [])
+    const list = Array.isArray(cands) ? cands : []
+    const norm = (s) => (s || '').toLowerCase().replace(/[’']/g, "'").trim()
+    const target = "the hitchhiker's guide to the galaxy"
+    const isAdams = (c) => /douglas adams/i.test(c.author || '')
+    const hit =
+      list.find(c => norm(c.title) === target && isAdams(c)) ||
+      list.find(c => norm(c.title).startsWith(target) && isAdams(c) && !/omnibus|ultimate|more than|complete|phase|hitch hiker/i.test(c.title)) ||
+      list.find(c => isAdams(c)) ||
+      list[0]
+    if (hit) {
+      // Use the showcase library's own cover (the book exists locally — the
+      // fulfill demo links it) instead of trusting external cover CDNs.
+      // Must be absolute: the API rejects non-http(s) cover URLs.
+      const cover = bookIds.hitchhiker ? `${API}/api/books/${bookIds.hitchhiker}/cover` : hit.cover_url
+      await wapi('/api/wishlist', { method: 'POST', body: JSON.stringify({ title: hit.title, author: hit.author, cover_url: cover, source: hit.source, source_id: hit.source_id, isbn: hit.isbn }) })
+    }
+  } catch { /* best effort */ }
+  // Whole-series wish: The Good Guys via series search (canonical id, true total,
+  // vol-1 cover) → 16/16 coverage.
+  try {
+    const r = await wapi(`/api/wishlist/search-series?q=${encodeURIComponent('the good guys')}`)
+    const series = await r.json().catch(() => [])
+    const gg = (Array.isArray(series) ? series : []).find(s => s.name === 'The Good Guys' && /ugland/i.test(s.author || '')) || (Array.isArray(series) ? series[0] : null)
+    if (gg) {
+      await wapi('/api/wishlist', { method: 'POST', body: JSON.stringify({ title: gg.name, series: gg.name, author: gg.author, cover_url: gg.cover_url, source: gg.source, source_id: gg.source_id, external_series_id: gg.source_id, series_total: gg.total }) })
+    }
+  } catch { /* best effort */ }
+}
+
+/** @type {Array<{name: string, path: string, viewport?: any, mobile?: boolean, waitFor?: string, settle?: number}>} */
+const SHOTS = [
+  // Desktop
+  { name: 'home', path: '/', viewport: DESKTOP, waitFor: 'h2, h3, [class*="streak"]' },
+  { name: 'dashboard', path: '/?view=large', viewport: DESKTOP, waitFor: 'img[loading="lazy"], [class*="grid"]' },
+  { name: 'series', path: '/?tab=series', viewport: DESKTOP, settle: 800 },
+  { name: 'book-detail', path: () => `/books/${bookIds.goodGuys2 ?? 1}`, viewport: DESKTOP, settle: 800 },
+  { name: 'series-detail', path: '/?tab=series&series_detail=Berserk', viewport: DESKTOP, settle: 1200, prefs: { tome_sidebar: 'closed' } },
+  { name: 'stats', path: '/stats', viewport: DESKTOP, settle: 1200 },
+  // Cropped view of the stats Overview tab — autoCrop trims to the centered content.
+  // Used on the landing page.
+  { name: 'stats-overview', path: '/stats', viewport: { width: 1600, height: 1400, deviceScaleFactor: 2 }, settle: 1500, autoCrop: true },
+
+  // Per-card element-bounded stats shots for /docs/stats. Each card gets its
+  // own tight crop so the docs can interleave shot + description per H3.
+  // Overview tab
+  // The headline stats are six separate dashboard tiles (no shared wrapper) —
+  // union-clip them. :has(p.font-bold.tabular-nums) picks the stat tile over
+  // the "Books Finished" chart widget that shares a title.
+  { name: 'stats-totals',             path: '/stats', viewport: { width: 1600, height: 1200, deviceScaleFactor: 2 }, settle: 1500,
+    elements: ['Reading Time', 'Sessions', 'Books Finished', 'Streak', 'Pages Turned', 'Completion Rate']
+      .map((t) => `div.rounded-xl:has(h3:text-is("${t}")):has(p.font-bold.tabular-nums)`) },
+  { name: 'stats-currently-reading',  path: '/stats', viewport: { width: 1400, height: 1200, deviceScaleFactor: 2 }, settle: 1500, element: 'div.rounded-xl:has(h3:text-is("Currently Reading"))' },
+  { name: 'stats-time-per-day',       path: '/stats', viewport: { width: 1400, height: 1200, deviceScaleFactor: 2 }, settle: 1500, element: 'div.rounded-xl:has(h3:text-is("Reading Time per Day"))' },
+  { name: 'stats-top-books',          path: '/stats', viewport: { width: 1400, height: 1200, deviceScaleFactor: 2 }, settle: 1500, element: 'div.rounded-xl:has(h3:text-is("Top Books by Reading Time"))' },
+  { name: 'stats-activity-grid',      path: '/stats', viewport: { width: 1400, height: 1200, deviceScaleFactor: 2 }, settle: 1500, element: 'div.rounded-xl:has(h3:has-text("Reading Activity"))' },
+
+  // Add-tile gallery modal — enter edit mode, open the gallery. The mini
+  // previews render live charts, so give them a beat to paint.
+  { name: 'stats-add-tile', path: '/stats', viewport: { width: 1600, height: 1300, deviceScaleFactor: 2 }, settle: 1500,
+    after: async (p) => {
+      await p.locator('button:has-text("Edit")').first().click()
+      await p.waitForTimeout(600)
+      await p.locator('button:has-text("Add tile")').first().click()
+      await p.waitForTimeout(1500)
+    },
+    element: 'div.max-w-3xl:has(h2:text-is("Add a widget"))' },
+
+  // Habits tab — click the Habits pill first
+  { name: 'stats-heatmap',           path: '/stats', viewport: { width: 1400, height: 1400, deviceScaleFactor: 2 }, settle: 1500, after: async (p) => { await p.locator('button:has-text("habits")').first().click().catch(() => {}); await p.waitForTimeout(700) }, element: 'div.rounded-xl:has(h3:has-text("Reading Intensity"))' },
+  { name: 'stats-session-timeline',  path: '/stats', viewport: { width: 1400, height: 1400, deviceScaleFactor: 2 }, settle: 1500, after: async (p) => { await p.locator('button:has-text("habits")').first().click().catch(() => {}); await p.waitForTimeout(700) }, element: 'div.rounded-xl:has(h3:text-is("Session Timeline"))' },
+  { name: 'stats-pace',              path: '/stats', viewport: { width: 1400, height: 1400, deviceScaleFactor: 2 }, settle: 1500, after: async (p) => { await p.locator('button:has-text("habits")').first().click().catch(() => {}); await p.waitForTimeout(700) }, element: 'div.rounded-xl:has(h3:text-is("Reading Pace"))' },
+  { name: 'stats-monthly-comparison', path: '/stats', viewport: { width: 1400, height: 1400, deviceScaleFactor: 2 }, settle: 1500, after: async (p) => { await p.locator('button:has-text("habits")').first().click().catch(() => {}); await p.waitForTimeout(700) }, element: 'div.rounded-xl:has(h3:has-text("Last 12 Months"))' },
+
+  // Library tab — click the Library pill first
+  { name: 'stats-series-completion', path: '/stats', viewport: { width: 1400, height: 1400, deviceScaleFactor: 2 }, settle: 1500, after: async (p) => { await p.locator('button:has-text("library")').first().click().catch(() => {}); await p.waitForTimeout(700) }, element: 'div.rounded-xl:has(h3:text-is("Series Completion"))' },
+  { name: 'stats-author-affinity',   path: '/stats', viewport: { width: 1400, height: 1400, deviceScaleFactor: 2 }, settle: 1500, after: async (p) => { await p.locator('button:has-text("library")').first().click().catch(() => {}); await p.waitForTimeout(700) }, element: 'div.rounded-xl:has(h3:text-is("Top Authors by Reading Time"))' },
+  { name: 'stats-completion-by-type',path: '/stats', viewport: { width: 1400, height: 1400, deviceScaleFactor: 2 }, settle: 1500, after: async (p) => { await p.locator('button:has-text("library")').first().click().catch(() => {}); await p.waitForTimeout(700) }, element: 'div.rounded-xl:has(h3:has-text("Finish Rate per Book Category"))' },
+  { name: 'stats-category-breakdown',path: '/stats', viewport: { width: 1400, height: 1400, deviceScaleFactor: 2 }, settle: 1500, after: async (p) => { await p.locator('button:has-text("library")').first().click().catch(() => {}); await p.waitForTimeout(700) }, element: 'div.rounded-xl:has(h3:text-is("Category Breakdown"))' },
+  { name: 'stats-library-growth',    path: '/stats', viewport: { width: 1400, height: 1400, deviceScaleFactor: 2 }, settle: 1500, after: async (p) => { await p.locator('button:has-text("library")').first().click().catch(() => {}); await p.waitForTimeout(700) }, element: 'div.rounded-xl:has(h3:has-text("Cumulative Books Added"))' },
+
+  // Docs — admin + feature surfaces (tier 2 sweep). All auto-cropped so the
+  // shot ends where the content ends instead of bleeding into the min-h-screen tail.
+  {
+    name: 'stats-habits',
+    path: '/stats',
+    viewport: { width: 1600, height: 2400, deviceScaleFactor: 2 },
+    settle: 1500,
+    autoCrop: true,
+    after: async (page) => {
+      await page.locator('button:has-text("habits")').first().click().catch(() => {})
+      await page.waitForTimeout(800)
+    },
+  },
+  {
+    name: 'stats-library',
+    path: '/stats',
+    viewport: { width: 1600, height: 2400, deviceScaleFactor: 2 },
+    settle: 1500,
+    autoCrop: true,
+    after: async (page) => {
+      await page.locator('button:has-text("library")').first().click().catch(() => {})
+      await page.waitForTimeout(800)
+    },
+  },
+  // v1.7.0 surfaces — word-count + page-stat stats, Highlights, admin word counts
+  { name: 'stats-words-read',    path: '/stats', viewport: { width: 1400, height: 1200, deviceScaleFactor: 2 }, settle: 1500, element: 'div.rounded-xl:has(h3:text-is("Words Read"))' },
+  { name: 'stats-reading-speed', path: '/stats', viewport: { width: 1500, height: 1300, deviceScaleFactor: 2 }, settle: 1500, after: async (page) => { await page.locator('button:has-text("habits")').first().click().catch(() => {}); await page.waitForTimeout(800) }, element: 'div.rounded-xl:has(h3:text-is("Reading Speed"))' },
+  { name: 'stats-book-length',   path: '/stats', viewport: { width: 1400, height: 1300, deviceScaleFactor: 2 }, settle: 1500, after: async (page) => { await page.locator('button:has-text("library")').first().click().catch(() => {}); await page.waitForTimeout(800) }, element: 'div.rounded-xl:has(h3:text-is("Book Length"))' },
+  { name: 'stats-rereads',       path: '/stats', viewport: { width: 1400, height: 1300, deviceScaleFactor: 2 }, settle: 1500, after: async (page) => { await page.locator('button:has-text("library")').first().click().catch(() => {}); await page.waitForTimeout(800) }, element: 'div.rounded-xl:has(h3:text-is("Re-reads"))' },
+  { name: 'book-intensity',      path: () => `/books/${bookIds.dune ?? 2}`, viewport: { width: 1400, height: 1400, deviceScaleFactor: 2 }, settle: 1200, element: 'div.rounded-xl:has(p:text-is("Reading intensity"))' },
+  // Bounded viewport (no autoCrop) — the list is long, so crop to the top: header,
+  // search, on-this-day, and the first couple of books.
+  { name: 'highlights',          path: '/highlights', viewport: { width: 1500, height: 1000, deviceScaleFactor: 2 }, settle: 1200 },
+  { name: 'admin-word-counts',   path: '/admin', viewport: { width: 1600, height: 1600, deviceScaleFactor: 2 }, settle: 1000, after: async (page) => { await page.locator('button:has-text("Word Counts")').first().click().catch(() => {}); await page.waitForTimeout(800) }, autoCrop: true },
+  { name: 'users-list',  path: '/users',    viewport: { width: 1600, height: 2000, deviceScaleFactor: 2 }, settle: 1000, autoCrop: true },
+  { name: 'admin-page',  path: '/admin',    viewport: { width: 1600, height: 2000, deviceScaleFactor: 2 }, settle: 1000, autoCrop: true },
+  { name: 'settings',    path: '/settings', viewport: { width: 1600, height: 2400, deviceScaleFactor: 2 }, settle: 1000, autoCrop: true },
+  { name: 'bindery',     path: '/bindery',  viewport: { width: 1600, height: 880, deviceScaleFactor: 2 }, settle: 1200, autoCrop: true,
+    after: async (page) => {
+      // select everything so the toolbar (Review / Quick Accept / Add to libraries) shows
+      for (const cb of await page.locator('input[type="checkbox"]').all()) await cb.check().catch(() => {})
+      await page.waitForTimeout(400)
+    } },
+
+  // Section/modal tight crops — capture exactly one block of UI via element selector.
+  {
+    name: 'settings-opds',
+    path: '/settings',
+    viewport: { width: 1600, height: 2000, deviceScaleFactor: 2 },
+    settle: 1000,
+    element: 'div.p-6.space-y-4:has(p:has-text("OPDS Catalog"))',
+  },
+  {
+    name: 'settings-api-tokens',
+    path: '/settings',
+    viewport: { width: 1600, height: 2400, deviceScaleFactor: 2 },
+    settle: 1000,
+    element: 'div.bg-card.rounded-xl:has(button:has-text("New Token"))',
+  },
+  {
+    name: 'settings-quick-connect',
+    path: '/settings',
+    viewport: { width: 1600, height: 2000, deviceScaleFactor: 2 },
+    settle: 1000,
+    element: 'div.p-5:has(p:text-is("Quick Connect"))',
+  },
+  {
+    name: 'settings-themes',
+    path: '/settings',
+    viewport: { width: 1600, height: 2000, deviceScaleFactor: 2 },
+    settle: 1000,
+    after: async (page) => {
+      await page.locator('h2:text-is("Appearance")').first().scrollIntoViewIfNeeded().catch(() => {})
+      await page.waitForTimeout(300)
+      // Add padding around the section element by expanding its box via a wrapper
+      await page.evaluate(() => {
+        const section = document.querySelector('section:has(span)')
+        const sections = [...document.querySelectorAll('section')]
+        const target = sections.find(s => s.querySelector('h2')?.textContent?.trim() === 'Appearance')
+        if (target) target.style.padding = '48px 32px'
+      })
+    },
+    element: 'section:has(h2:text-is("Appearance"))',
+  },
+  {
+    name: 'book-detail-edit',
+    path: () => `/books/${bookIds.goodGuys2 ?? 1}`,
+    viewport: { width: 1600, height: 1400, deviceScaleFactor: 2 },
+    settle: 1000,
+    after: async (page) => {
+      await page.locator('button:has-text("Edit")').first().click().catch(() => {})
+      await page.waitForTimeout(600)
+    },
+    autoCrop: true,
+  },
+  {
+    name: 'upload-modal',
+    path: '/',
+    viewport: { width: 1600, height: 1200, deviceScaleFactor: 2 },
+    settle: 1000,
+    after: async (page) => {
+      await page.locator('button:has-text("Upload")').first().click().catch(() => {})
+      await page.waitForTimeout(500)
+      await maskModalBackdrop(page)
+    },
+    element: 'div.max-w-lg:has(h2:has-text("Upload"))',
+  },
+  {
+    name: 'sidebar-libraries',
+    path: '/?tab=books',
+    viewport: { width: 1600, height: 1200, deviceScaleFactor: 2 },
+    settle: 1000,
+    prefs: { tome_sidebar: 'open' },
+    element: 'aside',
+  },
+  {
+    name: 'users-create-modal',
+    path: '/users',
+    viewport: { width: 1600, height: 1200, deviceScaleFactor: 2 },
+    settle: 800,
+    after: async (page) => {
+      await page.locator('button:has-text("New User")').first().click().catch(() => {})
+      await page.waitForTimeout(500)
+      await maskModalBackdrop(page)
+    },
+    element: 'div.max-w-md:has(h2:has-text("New User"))',
+  },
+  {
+    name: 'series-arcs-modal',
+    path: '/?tab=series&series_detail=Berserk',
+    viewport: { width: 1600, height: 1400, deviceScaleFactor: 2 },
+    settle: 1500,
+    after: async (page) => {
+      await page.locator('button[title="Manage series"]').first().click().catch(() => {})
+      await page.waitForTimeout(600)
+      await page.locator('div.max-w-3xl button:has-text("Arcs")').first().click().catch(() => {})
+      await page.waitForTimeout(500)
+      await maskModalBackdrop(page)
+    },
+    element: 'div.max-w-3xl:has(h2:has-text("Manage Series"))',
+  },
+  {
+    name: 'reader-epub',
+    path: () => `/reader/${bookIds.frankenstein ?? 1}`,
+    viewport: { width: 1400, height: 1000, deviceScaleFactor: 2 },
+    settle: 2500,
+    syncReaderTheme: true,
+    after: async (page) => {
+      await page.waitForSelector('foliate-view', { timeout: 8000 }).catch(() => {})
+      await page.waitForTimeout(2000)
+      // Click forward a few pages so the shot has real prose, not the cover.
+      const vp = page.viewportSize() || { width: 1400, height: 1000 }
+      for (let i = 0; i < 6; i++) {
+        await page.mouse.click(vp.width * 0.85, vp.height * 0.5)
+        await page.waitForTimeout(300)
+      }
+    },
+    cleanup: async (token, api) => {
+      const id = bookIds.frankenstein
+      if (!id) return
+      await fetch(`${api}/api/books/${id}/status`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ status: 'unread' }),
+      }).catch(() => {})
+    },
+  },
+
+  // Send to Device
+  {
+    name: 'settings-send-to-device',
+    path: '/settings',
+    viewport: { width: 1600, height: 2400, deviceScaleFactor: 2 },
+    settle: 1200,
+    after: async (page) => {
+      await page.evaluate(() => {
+        const sections = [...document.querySelectorAll('section')]
+        const target = sections.find(s => s.querySelector('h2')?.textContent?.trim() === 'Send to Device')
+        if (target) target.style.padding = '48px 32px'
+      })
+    },
+    element: 'section:has(h2:text-is("Send to Device"))',
+  },
+  {
+    name: 'settings-send-to-device-guide',
+    path: '/settings',
+    viewport: { width: 1600, height: 2400, deviceScaleFactor: 2 },
+    settle: 1200,
+    after: async (page) => {
+      await page.locator('button:has-text("How to set it up")').first().click().catch(() => {})
+      await page.waitForTimeout(500)
+      await page.evaluate(() => {
+        const sections = [...document.querySelectorAll('section')]
+        const target = sections.find(s => s.querySelector('h2')?.textContent?.trim() === 'Send to Device')
+        if (target) target.style.padding = '48px 32px'
+      })
+    },
+    element: 'section:has(h2:text-is("Send to Device"))',
+  },
+  {
+    name: 'admin-email',
+    path: '/admin',
+    viewport: { width: 1600, height: 2000, deviceScaleFactor: 2 },
+    settle: 1200,
+    after: async (page) => {
+      await page.locator('button:has-text("Email")').first().click().catch(() => {})
+      await page.waitForTimeout(800)
+    },
+    autoCrop: true,
+  },
+  // Configured state — requires SMTP set on the showcase backend.
+  {
+    name: 'settings-send-to-device-empty',
+    path: '/settings',
+    viewport: { width: 1600, height: 2400, deviceScaleFactor: 2 },
+    settle: 1200,
+    after: async (page) => {
+      await page.evaluate(() => {
+        const sections = [...document.querySelectorAll('section')]
+        const target = sections.find(s => s.querySelector('h2')?.textContent?.trim() === 'Send to Device')
+        if (target) target.style.padding = '48px 32px'
+      })
+    },
+    element: 'section:has(h2:text-is("Send to Device"))',
+  },
+  {
+    name: 'settings-send-to-device-prefilled',
+    path: '/settings',
+    viewport: { width: 1600, height: 2400, deviceScaleFactor: 2 },
+    settle: 1200,
+    after: async (page) => {
+      await page.fill('input[placeholder="My Kindle"]', "Benedict's Kindle").catch(() => {})
+      await page.fill('input[placeholder="user_abc@kindle.com"]', 'benedict_a1b2c3@kindle.com').catch(() => {})
+      await page.waitForTimeout(200)
+      await page.evaluate(() => {
+        const sections = [...document.querySelectorAll('section')]
+        const target = sections.find(s => s.querySelector('h2')?.textContent?.trim() === 'Send to Device')
+        if (target) target.style.padding = '48px 32px'
+      })
+    },
+    element: 'section:has(h2:text-is("Send to Device"))',
+  },
+  {
+    name: 'settings-send-to-device-added',
+    path: '/settings',
+    viewport: { width: 1600, height: 2400, deviceScaleFactor: 2 },
+    settle: 1200,
+    after: async (page) => {
+      await page.fill('input[placeholder="My Kindle"]', "Benedict's Kindle").catch(() => {})
+      await page.fill('input[placeholder="user_abc@kindle.com"]', 'benedict_a1b2c3@kindle.com').catch(() => {})
+      await page.locator('section:has(h2:text-is("Send to Device")) button:has-text("Add")').first().click().catch(() => {})
+      await page.waitForTimeout(900)
+      await page.evaluate(() => {
+        const sections = [...document.querySelectorAll('section')]
+        const target = sections.find(s => s.querySelector('h2')?.textContent?.trim() === 'Send to Device')
+        if (target) target.style.padding = '48px 32px'
+      })
+    },
+    // Remove the device we just added so re-runs start clean (empty/prefilled shots stay valid).
+    cleanup: async (token, api) => {
+      const res = await fetch(`${api}/api/devices`, { headers: { Authorization: `Bearer ${token}` } })
+      const devices = await res.json().catch(() => [])
+      for (const d of devices) {
+        await fetch(`${api}/api/devices/${d.id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }).catch(() => {})
+      }
+    },
+    element: 'section:has(h2:text-is("Send to Device"))',
+  },
+  // Send modal — single book. Requires SMTP configured + at least one device.
+  {
+    name: 'send-modal',
+    path: () => `/books/${bookIds.frankenstein ?? 1}`,
+    viewport: { width: 1600, height: 1200, deviceScaleFactor: 2 },
+    settle: 1000,
+    after: async (page) => {
+      await openSendEmailModal(page)
+      await maskModalBackdrop(page)
+    },
+    element: 'div.max-w-md:has(h2:has-text("Send to Device"))',
+  },
+  // Send modal — bulk (select all, open from dashboard toolbar).
+  {
+    name: 'send-modal-bulk',
+    path: '/?tab=books&view=large',
+    viewport: { width: 1600, height: 1200, deviceScaleFactor: 2 },
+    settle: 1000,
+    after: async (page) => {
+      await page.locator('button:has-text("Select")').first().click().catch(() => {})
+      await page.waitForTimeout(400)
+      await openSendEmailModal(page)
+      await maskModalBackdrop(page)
+    },
+    element: 'div.max-w-md:has(h2:has-text("Send to Device"))',
+  },
+  // Admin Email tab — configured (SMTP set + a device present).
+  {
+    name: 'admin-email-configured',
+    path: '/admin',
+    viewport: { width: 1600, height: 2000, deviceScaleFactor: 2 },
+    settle: 1200,
+    after: async (page) => {
+      await page.locator('button:has-text("Email")').first().click().catch(() => {})
+      await page.waitForTimeout(800)
+    },
+    autoCrop: true,
+  },
+
+  // ── Wishlist ────────────────────────────────────────────────────────────
+  // Empty state — clear benedict's wishes, then re-seed after capture so the
+  // populated shots below have data.
+  {
+    name: 'wishlist-empty',
+    path: '/wishlist',
+    viewport: { width: 1200, height: 900, deviceScaleFactor: 2 },
+    settle: 700,
+    after: async (page) => {
+      await clearWishes()
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      await page.waitForTimeout(800)
+    },
+    cleanup: async () => { await seedDemoWishes() },
+    autoCrop: true,
+  },
+  // Add-to-wishlist modal: search "The Good Guys", pick a result, flip to the
+  // whole-series confirm view.
+  {
+    name: 'wishlist-add-series',
+    path: '/wishlist',
+    viewport: { width: 1200, height: 1100, deviceScaleFactor: 2 },
+    settle: 600,
+    after: async (page) => {
+      await page.locator('button:has-text("Wish")').first().click().catch(() => {})
+      await page.waitForTimeout(500)
+      // Switch to Series mode, search Hardcover series, pick the Eric Ugland one.
+      await page.locator('div.max-w-lg button:has-text("Series")').first().click().catch(() => {})
+      await page.waitForTimeout(300)
+      await page.locator('div.max-w-lg input[placeholder*="series"]').first().fill('The Good Guys').catch(() => {})
+      await page.waitForTimeout(2800)  // live series search
+      await page.locator('div.max-w-lg button:has(p:has-text("Eric Ugland"))').first().click().catch(() => {})
+      await page.waitForTimeout(500)
+      await maskModalBackdrop(page)
+    },
+    element: 'div.max-w-lg:has(h2:has-text("Add to Wishlist"))',
+  },
+  // Member wishlist — Good Guys whole-series (16/16 coverage strip) + a single
+  // Hitchhiker's wish.
+  {
+    name: 'wishlist',
+    path: '/wishlist',
+    viewport: { width: 1200, height: 1100, deviceScaleFactor: 2 },
+    settle: 700,
+    after: async (page) => {
+      await seedDemoWishes()
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      await page.waitForTimeout(900)
+    },
+    autoCrop: true,
+  },
+  // Admin Wishlist tab — all members' wishes, coverage + fulfil controls.
+  {
+    name: 'wishlist-admin',
+    path: '/admin',
+    viewport: { width: 1600, height: 1600, deviceScaleFactor: 2 },
+    settle: 900,
+    after: async (page) => {
+      await seedDemoWishes()
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      await page.waitForTimeout(500)
+      await page.locator('button:has-text("Wishlist")').first().click().catch(() => {})
+      await page.waitForTimeout(800)
+    },
+    autoCrop: true,
+  },
+  // Admin fulfil picker — opened on the single Hitchhiker's wish, suggested
+  // book preselected.
+  {
+    name: 'wishlist-admin-fulfill',
+    path: '/admin',
+    viewport: { width: 1600, height: 1600, deviceScaleFactor: 2 },
+    settle: 900,
+    after: async (page) => {
+      await seedDemoWishes()
+      await page.reload({ waitUntil: 'domcontentloaded' })
+      await page.waitForTimeout(500)
+      await page.locator('button:has-text("Wishlist")').first().click().catch(() => {})
+      await page.waitForTimeout(800)
+      // Open the Fulfill picker on the Hitchhiker's (single-book) wish row.
+      await page.locator('div.rounded-xl:has(p:has-text("Hitch")) button:has-text("Fulfill")').first().click().catch(() => {})
+      await page.waitForTimeout(700)
+    },
+    element: 'div.rounded-xl:has(p:has-text("Hitch"))',
+  },
+
+  // ── Home: focus mode, Reading DNA, upcoming releases (docs roundtrip) ──────
+  {
+    name: 'home-focus',
+    path: '/',
+    viewport: DESKTOP,
+    settle: 2800,
+    prefs: { tome_home_mode: 'focus' },
+    after: async (page) => {
+      // spotlight a series book so the coverflow fan shows (standalones have none)
+      const strip = page.locator('button[title*="Skull"], button[title*="Berserk"]').first()
+      if (await strip.count()) {
+        await strip.click().catch(() => {})
+        await page.waitForTimeout(2500)
+      }
+    },
+  },
+  {
+    name: 'home-dna',
+    path: '/',
+    viewport: { width: 1600, height: 1600, deviceScaleFactor: 2 },
+    settle: 2200,
+    prefs: { tome_home_mode: 'dashboard', tome_dna_collapsed: '0' },
+    element: 'section:has(span:text-is("Reading DNA"))',
+  },
+  {
+    name: 'home-upcoming',
+    path: '/',
+    viewport: { width: 1600, height: 1600, deviceScaleFactor: 2 },
+    settle: 2200,
+    prefs: { tome_home_mode: 'dashboard' },
+    element: 'section:has(h2:has-text("Upcoming releases"))',
+  },
+
+  // ── Release detection: follow a series ─────────────────────────────────────
+  {
+    name: 'wishlist-following',
+    path: '/wishlist',
+    viewport: { width: 1500, height: 1300, deviceScaleFactor: 2 },
+    settle: 1800,
+    element: 'div:has(> div > h2:text-is("Following"))',
+    pad: 32,
+  },
+
+  // ── Metadata fetch dialog (merged candidates, best match, sources) ─────────
+  {
+    name: 'metadata-fetch',
+    path: () => `/books/${bookIds.berserk1 ?? 1}`,
+    viewport: { width: 1600, height: 1200, deviceScaleFactor: 2 },
+    settle: 1200,
+    after: async (page) => {
+      await page.locator('button:has(span:text-is("Fetch Metadata"))').first().click()
+        .catch(() => page.locator('button:has-text("Fetch Metadata")').first().click().catch(() => {}))
+      // live external searches — give it time, then let results settle
+      await page.locator('text=Best match').first().waitFor({ timeout: 45000 }).catch(() => {})
+      await page.waitForTimeout(1200)
+      await maskModalBackdrop(page)
+    },
+    element: 'div.fixed.inset-0 > div',
+  },
+
+  // ── Bindery review (libraries picker, match all, targeted suggestions) ─────
+  {
+    name: 'bindery-review',
+    path: '/bindery',
+    viewport: { width: 1600, height: 1300, deviceScaleFactor: 2 },
+    settle: 1800,
+    after: async (page) => {
+      for (const cb of await page.locator('input[type="checkbox"]').all()) {
+        await cb.check().catch(() => {})
+      }
+      await page.waitForTimeout(300)
+      await page.getByRole('button', { name: /review/i }).first().click().catch(() => {})
+      // wait for the suggestions panel's initial fetch to finish
+      await page.waitForTimeout(6000)
+    },
+  },
+
+  // ── Web reader annotations (create popover, painted highlight, tap card) ───
+  {
+    name: 'reader-annotation-create',
+    path: () => `/reader/${bookIds.frankenstein ?? 1}`,
+    viewport: { width: 1400, height: 1000, deviceScaleFactor: 2 },
+    settle: 2500,
+    syncReaderTheme: true,
+    after: async (page) => {
+      await seekToAnnotation(page)   // navigate to Letter 1
+      // select a DIFFERENT sentence so the popover isn't over the highlight
+      for (const f of page.frames()) {
+        try {
+          const ok = await f.evaluate(() => {
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
+            let node
+            while ((node = walker.nextNode())) {
+              const i = node.textContent.indexOf('I am already far north of London')
+              if (i >= 0) {
+                const end = node.textContent.indexOf('fills me')
+                const range = document.createRange()
+                range.setStart(node, i)
+                range.setEnd(node, end > i ? end + 'fills me'.length : node.textContent.length)
+                const sel = document.getSelection()
+                sel.removeAllRanges(); sel.addRange(range)
+                return true
+              }
+            }
+            return false
+          })
+          if (ok) break
+        } catch { /* cross-frame */ }
+      }
+      await page.waitForTimeout(1200)
+    },
+  },
+  // ── Web reader annotations (painted highlight + tap card) ──────────────────
+  {
+    name: 'reader-annotations',
+    path: () => `/reader/${bookIds.frankenstein ?? 1}`,
+    viewport: { width: 1400, height: 1000, deviceScaleFactor: 2 },
+    settle: 2500,
+    syncReaderTheme: true,
+    after: async (page) => {
+      await seekToAnnotation(page)
+    },
+  },
+  {
+    name: 'reader-annotation-card',
+    path: () => `/reader/${bookIds.frankenstein ?? 1}`,
+    viewport: { width: 1400, height: 1000, deviceScaleFactor: 2 },
+    settle: 2500,
+    syncReaderTheme: true,
+    after: async (page) => {
+      const r = await seekToAnnotation(page)
+      if (!r) return
+      await page.mouse.click(r.x, r.y)
+      await page.waitForTimeout(1200)
+    },
+  },
+
+  // Mobile (PWA)
+  { name: 'mobile-home', path: '/', mobile: true, waitFor: 'h2, h3, [class*="streak"]' },
+  // The dashboard remembers the active board server-side, so a previous shot's
+  // Habits/Library click would leak in — force the Overview pill.
+  { name: 'mobile-stats', path: '/stats', mobile: true, settle: 1200, after: async (p) => { await p.locator('button:has-text("overview")').first().click().catch(() => {}); await p.waitForTimeout(700) } },
+  { name: 'mobile-series', path: '/?tab=series', mobile: true, settle: 800 },
+  {
+    name: 'mobile-reader',
+    // Resolved at runtime from the showcase DB (Frankenstein's id can shift across re-seeds).
+    path: () => `/reader/${bookIds.frankenstein ?? 1}`,
+    mobile: true,
+    settle: 2500,  // foliate-view needs time to render the EPUB inside its iframe
+    after: async (page) => {
+      // First wait for the EPUB to actually be loaded by foliate-view —
+      // its inner iframe appears once content is ready.
+      await page.waitForSelector('foliate-view', { timeout: 8000 }).catch(() => {})
+      await page.waitForTimeout(2000)
+      // Turn a few pages so the screenshot shows real prose, not the cover.
+      const viewport = page.viewportSize() || { width: 390, height: 844 }
+      const x = viewport.width * 0.85
+      const y = viewport.height * 0.5
+      for (let i = 0; i < 10; i++) {
+        await page.touchscreen.tap(x, y)
+        await page.waitForTimeout(350)
+      }
+    },
+    // After the screenshot is captured, reset Frankenstein to unread so the
+    // showcase stays consistent across re-runs (the reader's auto-track would
+    // otherwise leave it marked as `reading` with stale progress).
+    cleanup: async (token, api) => {
+      const id = bookIds.frankenstein
+      if (!id) return
+      await fetch(`${api}/api/books/${id}/status`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ status: 'unread' }),
+      }).catch(() => {})
+    },
+  },
+  // Sidebar drawer needs interaction — open the hamburger after load
+  {
+    name: 'mobile-sidebar',
+    path: '/',
+    mobile: true,
+    after: async (page) => {
+      await page.locator('button[aria-label*="navigation" i], button:has-text("☰")').first().click().catch(() => {})
+      await page.waitForTimeout(400)
+    },
+  },
+  // ── Hardcover sync (showcase DB pre-seeded with demo match state) ──────────
+  // Flat list — every sync candidate with cover, state badge, rating, actions.
+  {
+    name: 'hardcover',
+    path: '/hardcover',
+    viewport: { width: 1600, height: 1250, deviceScaleFactor: 2 },
+    waitFor: 'button:has-text("Sync now")',
+    settle: 900,
+  },
+  // Series-stacked view (same grouping as All Books).
+  {
+    name: 'hardcover-grouped',
+    path: '/hardcover',
+    viewport: { width: 1600, height: 1250, deviceScaleFactor: 2 },
+    waitFor: 'button:has-text("Sync now")',
+    settle: 900,
+    prefs: { tome_hardcover_group: 'true' },
+  },
+  // Settings → Hardcover: linked account, sync toggle, counts.
+  {
+    name: 'settings-hardcover',
+    path: '/settings',
+    viewport: { width: 1600, height: 2400, deviceScaleFactor: 2 },
+    settle: 1000,
+    after: async (page) => {
+      await page.evaluate(() => {
+        const sections = [...document.querySelectorAll('section')]
+        const target = sections.find(s => s.querySelector('h2')?.textContent?.trim() === 'Hardcover')
+        if (target) {
+          target.scrollIntoView({ block: 'center' })
+          target.style.padding = '48px 32px'
+        }
+      })
+      await page.waitForTimeout(400)
+    },
+    element: 'section:has(h2:text-is("Hardcover"))',
+  },
+  // Book page progress bar with the edition-derived "p. X of Y".
+  {
+    name: 'hardcover-book-pages',
+    path: () => `/books/${bookIds.dungeonMauling ?? 1}`,
+    viewport: { width: 1600, height: 1400, deviceScaleFactor: 2 },
+    settle: 1000,
+    after: async (page) => {
+      await page.evaluate(() => {
+        const el = [...document.querySelectorAll('div, section')]
+          .find(n => /p\.\s*\d+ of \d+/.test(n.textContent || '') && n.querySelectorAll('*').length < 80)
+        if (el) {
+          el.scrollIntoView({ block: 'center' })
+          el.style.padding = '48px 32px'
+        }
+      })
+      await page.waitForTimeout(400)
+    },
+    autoCrop: true,
+  },
+  // Book page "Link KOReader sync" picker (#156) — a KOSync client (Readest)
+  // has synced a document that isn't attached to any book yet. State is
+  // seeded via the API in `after` (kosync account + one unlinked push with a
+  // fresh random hash) and the doc is linked away to an un-shot book in
+  // `cleanup`, so the picker reappears on every run and no other shot ever
+  // sees kosync chips. Registering benedict's kosync account persists in the
+  // showcase DB — the Settings KOSync section shows "linked" from then on.
+  {
+    name: 'kosync-link',
+    path: () => `/books/${bookIds.hailMary ?? 1}`,
+    viewport: { width: 1600, height: 1200, deviceScaleFactor: 2 },
+    settle: 800,
+    after: async (page) => {
+      const auth = { Authorization: `Bearer ${SHOT_TOKEN}`, 'Content-Type': 'application/json' }
+      // KOSync account for the showcase user (md5('showcase-sync') below).
+      await fetch(`${API}/api/auth/me/kosync`, { method: 'POST', headers: auth, body: JSON.stringify({ password: 'showcase-sync' }) })
+      // Self-heal: link away any unlinked docs left over from an aborted run.
+      const st = await (await fetch(`${API}/api/books/${bookIds.hailMary}/kosync-progress`, { headers: auth })).json().catch(() => ({}))
+      for (const d of st.unlinked_documents ?? []) {
+        await fetch(`${API}/api/books/${bookIds.berserk10}/link-kosync`, { method: 'POST', headers: auth, body: JSON.stringify({ document: d.document }) }).catch(() => {})
+      }
+      // One fresh unlinked Readest push, matching the book's 42% story.
+      KOSYNC_SHOT_DOC = crypto.randomUUID().replace(/-/g, '')
+      await fetch(`${API}/api/v1/syncs/progress`, {
+        method: 'PUT',
+        headers: { 'x-auth-user': USER, 'x-auth-key': '6eb4e22a1b3647d2644c64313cd9f5b5', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ document: KOSYNC_SHOT_DOC, progress: '/body/DocFragment[8]/body/p[12]', percentage: 0.42, device: 'Readest' }),
+      })
+      await page.reload({ waitUntil: 'networkidle' })
+      await page.waitForTimeout(900)
+      await page.locator('button:has-text("Link KOReader sync")').first().click()
+      await page.waitForTimeout(400)
+      await page.evaluate(() => {
+        const target = document.querySelector('select')?.closest('div.mt-4')
+        if (target) {
+          target.scrollIntoView({ block: 'center' })
+          target.style.padding = '48px 32px'
+        }
+      })
+      await page.waitForTimeout(300)
+    },
+    cleanup: async (token, api) => {
+      if (!KOSYNC_SHOT_DOC) return
+      await fetch(`${api}/api/books/${bookIds.berserk10}/link-kosync`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ document: KOSYNC_SHOT_DOC }),
+      }).catch(() => {})
+    },
+    element: 'div.mt-4:has(select)',
+  },
+]
+
+async function login() {
+  const r = await fetch(`${API}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: USER, password: PASS }),
+  })
+  if (!r.ok) throw new Error(`Login failed (${r.status}): ${await r.text()}`)
+  const j = await r.json()
+  return j.access_token
+}
+
+
+// Bring the seeded showcase highlight (opening sentence of Letter 1 in
+// Frankenstein) on screen and return its centre in iframe coordinates.
+// The overlay itself is not reachable from the outside, but the TEXT is —
+// find the sentence's Range in the section frame and use its box.
+async function seekToAnnotation(page) {
+  await page.waitForSelector('foliate-view', { timeout: 8000 }).catch(() => {})
+  await page.waitForTimeout(2500)
+  await page.evaluate(() => {
+    const v = document.querySelector('foliate-view')
+    const t = v?.book?.toc?.find(t => /letter\s*1\b/i.test(t.label))
+    if (t) v.goTo(t.href)
+  }).catch(() => {})
+  await page.waitForTimeout(3000)
+  for (const f of page.frames()) {
+    try {
+      const r = await f.evaluate(() => {
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
+        let node
+        while ((node = walker.nextNode())) {
+          const i = node.textContent.indexOf('You will rejoice to hear')
+          if (i >= 0) {
+            const range = document.createRange()
+            range.setStart(node, i)
+            range.setEnd(node, Math.min(node.textContent.length, i + 60))
+            const b = range.getBoundingClientRect()
+            return { x: b.x + b.width / 2, y: b.y + b.height / 2 }
+          }
+        }
+        return null
+      })
+      if (r) {
+        const frameEl = await f.frameElement().catch(() => null)
+        const box = frameEl ? await frameEl.boundingBox() : null
+        return box ? { x: box.x + r.x, y: box.y + r.y } : null
+      }
+    } catch { /* cross-frame */ }
+  }
+  return null
+}
+
+async function resolveBookIds(token) {
+  // Look up book IDs by title. Keeps the script working across re-seeds.
+  const wanted = { frankenstein: 'Frankenstein', goodGuys2: 'Heir Today, Pawn Tomorrow', hitchhiker: "The Hitchhiker's Guide to the Galaxy", dune: 'Dune', berserk1: 'Berserk, Vol. 1', dungeonMauling: 'Dungeon Mauling', hailMary: 'Project Hail Mary', berserk10: 'Berserk, Vol. 10' }
+  for (const [key, title] of Object.entries(wanted)) {
+    try {
+      const r = await fetch(`${API}/api/books?q=${encodeURIComponent(title)}&per_page=5`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      const data = await r.json()
+      const list = Array.isArray(data) ? data : (data.books ?? [])
+      const hit = list.find(b => b.title === title)
+      if (hit) bookIds[key] = hit.id
+    } catch (e) {
+      console.warn(`  ! Could not resolve book ID for ${title}:`, e.message)
+    }
+  }
+}
+
+// When capturing a modal as a tight element shot, paint the dark fixed-inset
+// backdrop with the exact docs page background so the modal's rounded corner
+// cutouts blend invisibly into the docs site instead of revealing the showcase
+// page content (or dark fill) underneath.
+async function maskModalBackdrop(page) {
+  await page.evaluate(() => {
+    // Match website/src/styles/global.css --bg values (docs site bg per theme).
+    const themeBg = {
+      light: 'oklch(0.99 0 0)',
+      dark:  'oklch(0.13 0 0)',
+      amber: 'oklch(0.97 0.025 80)',
+    }
+    const html = document.documentElement
+    const theme = html.classList.contains('theme-amber') ? 'amber'
+                : html.classList.contains('dark') ? 'dark'
+                : 'light'
+    const bg = themeBg[theme]
+    document.querySelectorAll('.fixed.inset-0').forEach(el => {
+      el.style.background = bg
+      el.style.backdropFilter = 'none'
+      el.style.webkitBackdropFilter = 'none'
+    })
+    document.querySelectorAll('.absolute.inset-0').forEach(el => {
+      // el.className is an SVGAnimatedString on SVG elements — use the attribute
+      if ((el.getAttribute('class') || '').includes('bg-black')) {
+        el.style.background = bg
+        el.style.backdropFilter = 'none'
+        el.style.webkitBackdropFilter = 'none'
+      }
+    })
+  })
+}
+
+// Open the email send modal regardless of the TOME_SEND_TO_KOREADER flag:
+// flag off → plain "Send to Device" button; flag on → split "Send to KOReader ▾"
+// button whose dropdown holds "Send via email…".
+async function openSendEmailModal(page) {
+  const plain = page.locator('button:has-text("Send to Device")').first()
+  if (await plain.count()) {
+    await plain.click().catch(() => {})
+  } else {
+    await page.locator('button[aria-label="More send options"]').first().click().catch(() => {})
+    await page.waitForTimeout(250)
+    await page.locator('button:has-text("Send via email")').first().click().catch(() => {})
+  }
+  await page.waitForTimeout(600)
+}
+
+async function captureShot(browser, token, shot) {
+  const context = await browser.newContext(shot.mobile ? MOBILE : { viewport: shot.viewport })
+  const theme = THEME ?? shot.theme ?? 'light'
+  const prefs = { tome_stats_hint: '1', ...(DASHBOARD ? { tome_stats_lab_v2: DASHBOARD } : {}), ...(shot.prefs ?? {}) }
+  // Reader has its own theme (light/sepia/dark) stored separately. For shots
+  // that render the reader, mirror the app theme — amber → sepia (amber isn't
+  // a valid reader theme).
+  const pathStr = typeof shot.path === 'function' ? shot.path() : shot.path
+  if (shot.syncReaderTheme || pathStr.startsWith('/reader/')) {
+    prefs.reader_theme = theme === 'amber' ? 'sepia' : theme
+  }
+  await context.addInitScript(({ t, theme, prefs }) => {
+    localStorage.setItem('tome_token', t)
+    localStorage.setItem('tome_theme', theme)
+    for (const [k, v] of Object.entries(prefs)) localStorage.setItem(k, v)
+  }, { t: token, theme, prefs })
+  const page = await context.newPage()
+  await page.goto(`${BASE}${pathStr}`, { waitUntil: 'domcontentloaded' })
+  if (shot.waitFor) {
+    await page.waitForSelector(shot.waitFor, { timeout: 10000 }).catch(() => {})
+  }
+  await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {})
+  if (shot.after) await shot.after(page)
+  if (shot.settle) await page.waitForTimeout(shot.settle)
+  const file = path.join(OUT, `${shot.name}.png`)
+  // Union-of-elements screenshot: clips to the union bounding box of every
+  // selector match plus padding. For content that is N sibling tiles with no
+  // shared wrapper — e.g. the stats dashboard's headline stat row, where the
+  // grid items are absolutely-positioned siblings of every other tile.
+  if (shot.elements) {
+    const pad = shot.elementsPad ?? 16
+    let box = null
+    for (const sel of shot.elements) {
+      for (const loc of await page.locator(sel).all()) {
+        const b = await loc.boundingBox()
+        if (!b) continue
+        box = box
+          ? {
+              x: Math.min(box.x, b.x),
+              y: Math.min(box.y, b.y),
+              right: Math.max(box.right, b.x + b.width),
+              bottom: Math.max(box.bottom, b.y + b.height),
+            }
+          : { x: b.x, y: b.y, right: b.x + b.width, bottom: b.y + b.height }
+      }
+    }
+    if (!box) throw new Error(`${shot.name}: no elements matched`)
+    const clip = {
+      x: Math.max(0, box.x - pad),
+      y: Math.max(0, box.y - pad),
+      width: box.right - box.x + pad * 2,
+      height: box.bottom - box.y + pad * 2,
+    }
+    await page.screenshot({ path: file, clip })
+    await context.close()
+    return file
+  }
+  // Element-bounded screenshot: crops exactly to the target element's bounding
+  // box, ideal for capturing a single section or modal without manual clip math.
+  if (shot.element) {
+    const locator = page.locator(shot.element).first()
+    await locator.waitFor({ timeout: 6000 }).catch(() => {})
+    if (shot.pad) {
+      // generous breathing room around tight sections (borderless crops)
+      const b = await locator.boundingBox()
+      if (!b) throw new Error(`${shot.name}: element has no box`)
+      const vp = page.viewportSize()
+      const clip = {
+        x: Math.max(0, b.x - shot.pad),
+        y: Math.max(0, b.y - shot.pad),
+        width: Math.min(vp.width, b.x + b.width + shot.pad) - Math.max(0, b.x - shot.pad),
+        height: Math.min(vp.height, b.y + b.height + shot.pad) - Math.max(0, b.y - shot.pad),
+      }
+      await page.screenshot({ path: file, clip })
+    } else {
+      await locator.screenshot({ path: file })
+    }
+    await context.close()
+    return file
+  }
+  let clip = shot.clip
+  if (!clip && shot.autoCrop) {
+    // Tight bounding-box crop. Walks the DOM, skipping elements that span
+    // ≥95% of the viewport (full-width wrappers like .min-h-screen) and
+    // anything fixed/sticky/hidden. The remaining centered/inner elements
+    // give us the actual content bounds — both horizontal and vertical.
+    const pad = shot.autoCropPad ?? 24
+    const measured = await page.evaluate((pad) => {
+      let minLeft = Infinity, maxRight = 0, maxBottom = 0
+      const walk = (el) => {
+        const style = window.getComputedStyle(el)
+        if (style.position === 'fixed' || style.position === 'sticky') return
+        if (style.display === 'none' || style.visibility === 'hidden') return
+        const rect = el.getBoundingClientRect()
+        const isWideContainer = rect.width >= window.innerWidth * 0.95
+        if (!isWideContainer && rect.width > 0 && rect.height > 0) {
+          if (rect.left < minLeft) minLeft = rect.left
+          if (rect.right > maxRight) maxRight = rect.right
+          if (rect.bottom > maxBottom) maxBottom = rect.bottom
+        }
+        for (const child of el.children) walk(child)
+      }
+      walk(document.body)
+      if (!Number.isFinite(minLeft) || maxBottom === 0) return null
+      // Symmetric crop: mirror around viewport center using the larger reach.
+      // Avoids the docs page looking like the content is glued to one side.
+      const center = window.innerWidth / 2
+      const halfWidth = Math.max(center - minLeft, maxRight - center)
+      const left = Math.max(0, Math.floor(center - halfWidth - pad))
+      const right = Math.min(window.innerWidth, Math.ceil(center + halfWidth + pad))
+      return {
+        x: left,
+        y: 0,
+        width: right - left,
+        height: Math.ceil(maxBottom + pad),
+      }
+    }, pad)
+    if (measured) clip = measured
+  }
+  await page.screenshot({ path: file, fullPage: false, ...(clip ? { clip } : {}) })
+  await context.close()
+  return file
+}
+
+async function main() {
+  await mkdir(OUT, { recursive: true })
+
+  const shots = ONLY ? SHOTS.filter(s => ONLY.includes(s.name)) : SHOTS
+  if (ONLY && shots.length !== ONLY.length) {
+    const missing = ONLY.filter(n => !shots.find(s => s.name === n))
+    console.warn(`Unknown shot name(s): ${missing.join(', ')}`)
+  }
+
+  let token = TOKEN
+  if (!token) {
+    console.log(`Logging in as ${USER} against ${API}...`)
+    token = await login()
+  } else {
+    console.log('Using TOME_SCREENSHOT_TOKEN (skipping /login)')
+  }
+  SHOT_TOKEN = token
+
+  await resolveBookIds(token)
+  if (Object.keys(bookIds).length) {
+    console.log(`Resolved book IDs:`, bookIds)
+  }
+
+  console.log(`Capturing ${shots.length} shot(s) → ${OUT}`)
+  const browser = await chromium.launch()
+  try {
+    for (const shot of shots) {
+      const t0 = Date.now()
+      try {
+        const file = await captureShot(browser, token, shot)
+        console.log(`  ✓ ${shot.name.padEnd(20)} ${path.relative(process.cwd(), file)} (${Date.now() - t0}ms)`)
+        if (shot.cleanup) await shot.cleanup(token, API)
+      } catch (e) {
+        // One flaky shot shouldn't sink the whole pass (esp. across 3 themes).
+        console.warn(`  ✗ ${shot.name.padEnd(20)} FAILED: ${String(e.message ?? e).split('\n')[0]}`)
+      }
+    }
+  } finally {
+    await browser.close()
+  }
+}
+
+main().catch(e => {
+  console.error('Screenshot run failed:', e.message)
+  process.exit(1)
+})

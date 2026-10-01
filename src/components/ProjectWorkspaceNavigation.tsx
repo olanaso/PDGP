@@ -1,6 +1,7 @@
 import { Link, useRouterState } from "@tanstack/react-router";
 import {
   BarChart3,
+  Box,
   ChevronDown,
   ClipboardCheck,
   ClipboardList,
@@ -25,7 +26,8 @@ type ProjectRoute =
   | "/proyectos/$projectId/codigos-planos"
   | "/proyectos/$projectId/codigos-predios"
   | "/proyectos/$projectId/expedientes"
-  | "/proyectos/$projectId/padron-preliminar";
+  | "/proyectos/$projectId/padron-preliminar"
+  | "/proyectos/$projectId/bim";
 
 type ProjectMenuItem = {
   number: string;
@@ -127,6 +129,20 @@ const PROJECT_MENU_GROUPS: ProjectMenuGroup[] = [
         label: "Padrón preliminar",
         icon: FileSpreadsheet,
         route: "/proyectos/$projectId/padron-preliminar",
+      },
+    ],
+  },
+  {
+    number: "4",
+    label: "BIM del proyecto",
+    description: "IFC consolidado y visor 3D",
+    icon: Box,
+    items: [
+      {
+        number: "4.1",
+        label: "Modelo BIM (IFC)",
+        icon: Box,
+        route: "/proyectos/$projectId/bim",
       },
     ],
   },

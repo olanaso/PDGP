@@ -1,0 +1,2499 @@
+import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react'
+import { AnimatePresence, m } from 'motion/react'
+import { Link, useSearchParams, useNavigate } from 'react-router-dom'
+import {
+  BookOpen, X, Home, ChevronRight,
+  LayoutGrid, List,
+  ChevronUp, ChevronDown, SlidersHorizontal, Loader2,
+  Library as LibraryIcon, CheckSquare, XSquare, Download, Pencil,
+  Flame, BookCheck, Clock, BookOpenCheck, Play, CheckCheck, Trash2, Settings2, Layers, Star, Quote, Moon, Shuffle, Share2,
+} from 'lucide-react'
+import { AppHeader, HeaderSearch } from '@/components/AppHeader'
+import { ModalShell } from '@/components/ModalShell'
+import { useAuth, isMember, isAdmin } from '@/contexts/AuthContext'
+import { Trans, useLingui, Plural } from '@lingui/react/macro'
+import { t, plural, msg } from '@lingui/core/macro'
+import type { MessageDescriptor } from '@lingui/core'
+import { useToast } from '@/contexts/ToastContext'
+import { useSidebarLists } from '@/lib/sidebarLists'
+import { BookCard, type ViewMode } from '@/components/BookCard'
+import { SeriesStackCard } from '@/components/SeriesStackCard'
+import { StarRating } from '@/components/StarRating'
+import { SeriesRating } from '@/components/SeriesRating'
+import { SeriesFollowButton } from '@/components/SeriesFollowButton'
+import { ShareModal } from '@/components/ShareShelfModal'
+import { UpcomingReleases } from '@/components/UpcomingReleases'
+import { CoverImage } from '@/components/CoverImage'
+import { HScrollRow } from '@/components/HScrollRow'
+import { Sidebar } from '@/components/Sidebar'
+import { SaveFilterButton } from '@/components/SaveFilterButton'
+import { AutocompleteInput } from '@/components/AutocompleteInput'
+import { UploadModal } from '@/components/UploadModal'
+import { ManageSeriesModal } from '@/components/ManageSeriesModal'
+import { SendButton } from '@/components/SendButton'
+import { BookAnimation } from '@/components/BookAnimation'
+import { HomeGoalRings } from '@/components/stats/GoalWidget'
+import { ReadingDNACard } from '@/components/stats/ReadingDNACard'
+import type { ReadingDNA } from '@/components/stats/shared'
+import { FocusMode } from '@/components/home/FocusMode'
+import { api } from '@/lib/api'
+import type { Book, ReadingStatus, Arc, SeriesMeta, SeriesStatus } from '@/lib/books'
+import { formatBytes } from '@/lib/books'
+import { useBookTypes } from '@/lib/bookTypes'
+import { useShiftSelect } from '@/lib/useShiftSelect'
+import { cn } from '@/lib/utils'
+import { describePace, formatEstimateDays, formatEstimateHours, type BacklogSummary } from '@/lib/backlog'
+import { SeriesReadingStats } from '@/components/SeriesReadingStats'
+
+type SortField = 'title' | 'author' | 'year' | 'added_at' | 'rating'
+type SortOrder = 'asc' | 'desc'
+
+interface SeriesItem {
+  name: string
+  book_count: number
+  cover_book_id: number
+  description: string | null
+  author: string | null
+  read_count: number
+  reading_count: number
+  rating: number | null
+}
+
+interface SeriesDetailBook {
+  id: number
+  title: string
+  series_index: number | null
+  cover_path: string | null
+  reading_status: 'unread' | 'reading' | 'read' | 'shelved' | 'want_to_read'
+  progress_pct: number | null
+}
+
+interface SeriesDetail {
+  name: string
+  author: string | null
+  backlog: BacklogSummary | null
+  description: string | null
+  books: SeriesDetailBook[]
+}
+
+interface Facets {
+  series: string[]
+  authors: string[]
+  tags: string[]
+  formats: string[]
+  languages: { code: string; label: string }[]
+}
+
+interface HomeStats {
+  current_streak_days: number
+  books_finished_30d: number
+  reading_seconds_30d: number
+  pages_turned_30d: number
+}
+
+interface ActivityEntry {
+  book_id: number
+  book_title: string
+  book_cover_path: string | null
+  started_at: string
+  duration_seconds: number
+  pages_turned: number
+}
+
+interface ForgottenBook {
+  book_id: number
+  title: string
+  author: string | null
+  has_cover: boolean
+  last_read: string | null
+  days_ago: number | null
+}
+
+interface HighlightSpotlight {
+  on_this_day: boolean
+  highlight: {
+    id: number
+    book_id: number
+    book_title: string
+    book_author: string | null
+    highlighted_text: string | null
+  } | null
+}
+
+const SORT_LABELS: Record<SortField, MessageDescriptor> = {
+  title: msg`Title`, author: msg`Author`, year: msg`Year`, added_at: msg`Date Added`, rating: msg`My Rating`,
+}
+
+// Reading-status + series-status display names, shared by filter buttons and chips.
+const READING_STATUS_LABELS: Record<string, MessageDescriptor> = {
+  unread: msg`Unread`, want_to_read: msg`Want to Read`, reading: msg`Reading`,
+  read: msg`Read`, shelved: msg`Shelved`,
+}
+const MISSING_LABELS: Record<string, MessageDescriptor> = {
+  cover: msg`Cover`, description: msg`Description`, author: msg`Author`,
+  series: msg`Series`, any: msg`Any`,
+}
+const SERIES_STATUS_LABELS: Record<string, MessageDescriptor> = {
+  ongoing: msg`ongoing`, finished: msg`finished`, hiatus: msg`hiatus`,
+}
+
+const VIEW_KEY = 'tome_view'
+const GRID_SIZE_KEY = 'tome_grid_size'
+const GRID_SIZE_MIN = 110
+const GRID_SIZE_MAX = 240
+type ViewPref = 'grid' | 'list'
+const SORT_KEY = 'tome_sort'
+const ORDER_KEY = 'tome_order'
+const GROUP_KEY = 'tome_group_series'
+
+// ── Bulk Delete Modal ──────────────────────────────────────────────────────────
+interface BulkDeleteModalProps {
+  open: boolean
+  books: Book[]
+  selectedIds: Set<number>
+  onCancel: () => void
+  onConfirm: () => Promise<void>
+}
+
+function BulkDeleteModal({ open, books, selectedIds, onCancel, onConfirm }: BulkDeleteModalProps) {
+  const { t } = useLingui()
+  const [deleting, setDeleting] = useState(false)
+
+  const selectedBooks = books.filter(b => selectedIds.has(b.id))
+
+  async function handleDelete() {
+    setDeleting(true)
+    await onConfirm()
+    setDeleting(false)
+  }
+
+  return (
+    <ModalShell open={open} onClose={() => { if (!deleting) onCancel() }} className="w-full max-w-md">
+        <div className="bg-card border border-border rounded-2xl shadow-2xl shadow-accent-soft flex flex-col max-h-[80vh]">
+          {/* Header */}
+          <div className="flex items-center justify-between px-6 pt-6 pb-4 shrink-0">
+            <div className="flex items-center gap-2">
+              <Trash2 className="w-4 h-4 text-destructive" />
+              <h2 className="text-base font-semibold text-foreground">
+                <Plural value={selectedIds.size} one="Delete # book" other="Delete # books" />
+              </h2>
+            </div>
+            <button
+              onClick={onCancel}
+              disabled={deleting}
+              className="text-muted-foreground hover:text-foreground transition-colors"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          {/* Warning */}
+          <div className="px-6 pb-3 shrink-0">
+            <p className="text-xs text-destructive bg-destructive/10 border border-destructive/20 rounded-lg px-3 py-2">
+              <Trans>This permanently removes the selected books and their files from disk. This cannot be undone.</Trans>
+            </p>
+          </div>
+
+          {/* Book list */}
+          <div className="overflow-y-auto flex-1 px-6 pb-3">
+            <div className="flex flex-col gap-1">
+              {selectedBooks.map(book => {
+                const primaryFile = book.files[0] ?? null
+                return (
+                  <div key={book.id} className="flex items-center gap-3 py-2 border-b border-border last:border-0">
+                    <div className="relative w-8 h-11 rounded overflow-hidden shrink-0 border border-border">
+                      <CoverImage
+                        src={book.cover_path ? `/api/books/${book.id}/cover` : null}
+                        alt={book.title}
+                        iconClassName="w-3.5 h-3.5"
+                      />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium text-foreground truncate leading-tight">{book.title}</p>
+                      {book.author && (
+                        <p className="text-xs text-muted-foreground truncate">{book.author}</p>
+                      )}
+                      {primaryFile && (
+                        <p className="text-[10px] text-muted-foreground/70 truncate">
+                          {primaryFile.format.toUpperCase()}
+                          {primaryFile.file_size ? ` · ${formatBytes(primaryFile.file_size)}` : ''}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+              {selectedIds.size > selectedBooks.length && (
+                <p className="text-xs text-muted-foreground py-2">
+                  {(() => { const more = selectedIds.size - selectedBooks.length; return t`…and ${more} more not shown` })()}
+                </p>
+              )}
+            </div>
+          </div>
+
+          {/* Footer */}
+          <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-border shrink-0">
+            {deleting && (
+              <span className="text-xs text-muted-foreground mr-auto">
+                <Plural value={selectedIds.size} one="Deleting # book..." other="Deleting # books..." />
+              </span>
+            )}
+            <button
+              onClick={onCancel}
+              disabled={deleting}
+              className="px-3 py-1.5 rounded-lg text-sm border border-border text-muted-foreground hover:bg-muted disabled:opacity-50 transition-colors"
+            >
+              <Trans>Cancel</Trans>
+            </button>
+            <button
+              onClick={handleDelete}
+              disabled={deleting}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm bg-destructive text-destructive-foreground hover:opacity-90 disabled:opacity-50 transition-all"
+            >
+              {deleting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+              <Plural value={selectedIds.size} one="Delete # book" other="Delete # books" />
+            </button>
+          </div>
+        </div>
+    </ModalShell>
+  )
+}
+
+// Duration abbreviations go through the catalog so locales can adapt the units.
+function formatReadingTime(seconds: number): string {
+  if (seconds < 60) return t`${seconds}s`
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  if (h === 0) return t`${m}m`
+  if (m === 0) return t`${h}h`
+  return t`${h}h ${m}m`
+}
+
+export function DashboardPage() {
+  const { t, i18n } = useLingui()
+  const { user } = useAuth()
+  const navigate = useNavigate()
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [focusedIndex, setFocusedIndex] = useState<number | null>(null)
+
+  // ── View / sort (persisted) ───────────────────────────────────────────────
+  // Two view modes (grid/list) + a cover-size slider for the grid. Old installs
+  // stored 'large' | 'small' — those migrate to grid at the matching size.
+  const [view, setView] = useState<ViewPref>(() =>
+    localStorage.getItem(VIEW_KEY) === 'list' ? 'list' : 'grid')
+  const [gridSize, setGridSize] = useState<number>(() => {
+    const stored = Number(localStorage.getItem(GRID_SIZE_KEY))
+    if (stored >= GRID_SIZE_MIN && stored <= GRID_SIZE_MAX) return stored
+    return localStorage.getItem(VIEW_KEY) === 'small' ? 120 : 180
+  })
+  const [sort, setSort] = useState<SortField>(() =>
+    (localStorage.getItem(SORT_KEY) as SortField | null) ?? 'title')
+  const [order, setOrder] = useState<SortOrder>(() =>
+    (localStorage.getItem(ORDER_KEY) as SortOrder | null) ?? 'asc')
+
+  function persistView(v: ViewPref) { setView(v); localStorage.setItem(VIEW_KEY, v) }
+  function persistGridSize(s: number) { setGridSize(s); localStorage.setItem(GRID_SIZE_KEY, String(s)) }
+  function persistSort(s: SortField) { setSort(s); localStorage.setItem(SORT_KEY, s) }
+  function persistOrder(o: SortOrder) { setOrder(o); localStorage.setItem(ORDER_KEY, o) }
+
+  // ── Group by series (persisted) ───────────────────────────────────────────
+  const [groupBySeries, setGroupBySeries] = useState(() => localStorage.getItem(GROUP_KEY) === 'true')
+  function persistGroup(v: boolean) {
+    setGroupBySeries(v)
+    localStorage.setItem(GROUP_KEY, String(v))
+    if (v) exitSelectionMode()
+  }
+
+  // ── Tab (Home / Books / Series) — derived from URL ───────────────────────
+  const tab = (searchParams.get('tab') || 'home') as 'home' | 'books' | 'series'
+  const [seriesList, setSeriesList] = useState<SeriesItem[]>([])
+  const [seriesLoading, setSeriesLoading] = useState(false)
+  const [expandedSeries, setExpandedSeries] = useState<string | null>(null)
+  const [seriesDetail, setSeriesDetail] = useState<SeriesDetail | null>(null)
+  const [shareSeries, setShareSeries] = useState<string | null>(null)
+  const [seriesDetailLoading, setSeriesDetailLoading] = useState(false)
+  const [markingAllRead, setMarkingAllRead] = useState(false)
+  const [contentType, setContentType] = useState<string>('volume')
+  // Series meta (status badges) — keyed by series name
+  const [seriesMetaMap, setSeriesMetaMap] = useState<Record<string, SeriesStatus>>({})
+  // Arcs for the currently open series detail
+  const [seriesArcs, setSeriesArcs] = useState<Arc[]>([])
+  // Manage series modal
+  const [manageSeriesOpen, setManageSeriesOpen] = useState(false)
+  const [seriesDescExpanded, setSeriesDescExpanded] = useState(false)
+
+  function setTab(value: 'home' | 'books' | 'series') {
+    setSearchParams(prev => {
+      const next = new URLSearchParams(prev)
+      if (value === 'home') next.delete('tab')
+      else next.set('tab', value)
+      return next
+    })
+  }
+
+  function fetchSeriesMetaForList(_list: SeriesItem[]) {
+    // Single batch call — previously fired one GET per series which
+    // exhausted the DB connection pool on libraries with many series.
+    api.get<Record<string, SeriesStatus>>('/series/meta-map')
+      .then(map => setSeriesMetaMap(map))
+      .catch(() => {})
+  }
+
+  function openSeriesTab() {
+    setTab('series')
+    setExpandedSeries(null)
+    setSeriesDetail(null)
+    setSeriesLoading(true)
+    api.get<SeriesItem[]>('/books/series')
+      .then(list => {
+        setSeriesList(list)
+        fetchSeriesMetaForList(list)
+      })
+      .catch(() => {})
+      .finally(() => setSeriesLoading(false))
+  }
+
+  function openSeriesDetail(seriesName: string) {
+    if (expandedSeries === seriesName) {
+      setExpandedSeries(null)
+      setSeriesDetail(null)
+      setSeriesArcs([])
+      return
+    }
+    setExpandedSeries(seriesName)
+    setSeriesDetailLoading(true)
+    setSeriesDetail(null)
+    setSeriesArcs([])
+    setSeriesDescExpanded(false)
+    Promise.all([
+      api.get<SeriesDetail>(`/books/series-detail?name=${encodeURIComponent(seriesName)}`),
+      api.get<Arc[]>(`/series/${encodeURIComponent(seriesName)}/arcs`),
+    ])
+      .then(([detail, arcs]) => {
+        setSeriesDetail(detail)
+        setSeriesArcs(arcs)
+      })
+      .catch(() => {})
+      .finally(() => setSeriesDetailLoading(false))
+  }
+
+  // Auto-open series detail when navigating via ?tab=series&series_detail=Name
+  useEffect(() => {
+    if (tab !== 'series') return
+    const detailName = searchParams.get('series_detail')
+    if (!detailName || detailName === expandedSeries) return
+    // Load series list first, then open the detail
+    setSeriesLoading(true)
+    api.get<SeriesItem[]>('/books/series')
+      .then(list => {
+        setSeriesList(list)
+        fetchSeriesMetaForList(list)
+        setSeriesLoading(false)
+        openSeriesDetail(detailName)
+      })
+      .catch(() => setSeriesLoading(false))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, searchParams])
+
+  function getContinueBook(books: SeriesDetailBook[]): SeriesDetailBook | null {
+    if (books.length === 0) return null
+    const reading = books.find(b => b.reading_status === 'reading')
+    if (reading) return reading
+    // Explicit intent beats position: a queued (want-to-read) volume is next.
+    const queued = books.find(b => b.reading_status === 'want_to_read')
+    if (queued) return queued
+    // Find first unread where previous volume (by index order) is read
+    for (let i = 1; i < books.length; i++) {
+      if (books[i].reading_status === 'unread' && books[i - 1].reading_status === 'read') {
+        return books[i]
+      }
+    }
+    return books.find(b => b.reading_status === 'unread') ?? null
+  }
+
+  function groupVolumesByArc(books: SeriesDetailBook[], arcs: Arc[]): Array<{
+    label: string
+    description: string | null
+    volumes: SeriesDetailBook[]
+  }> {
+    if (arcs.length === 0) return [{ label: '', description: null, volumes: books }]
+    const sorted = [...arcs].sort((a, b) => a.start_index - b.start_index)
+    const sections: Array<{ label: string; description: string | null; volumes: SeriesDetailBook[] }> = sorted.map(arc => {
+      const { name, start_index, end_index } = arc
+      return {
+        label: t`${name} · Vol. ${start_index}–${end_index}`,
+        description: arc.description ?? null,
+        volumes: books.filter(v =>
+          v.series_index != null &&
+          v.series_index >= arc.start_index &&
+          v.series_index <= arc.end_index
+        ),
+      }
+    })
+    const unassigned = books.filter(v =>
+      v.series_index == null ||
+      !sorted.some(a => v.series_index! >= a.start_index && v.series_index! <= a.end_index)
+    )
+    if (unassigned.length > 0) {
+      sections.push({ label: t`Unassigned`, description: null, volumes: unassigned })
+    }
+    return sections.filter(s => s.volumes.length > 0)
+  }
+
+  function SeriesStatusBadge({ status }: { status: SeriesStatus | undefined }) {
+    if (!status || status === 'unknown') return null
+    /* eslint-disable lingui/no-unlocalized-strings -- Tailwind classes */
+    const cls =
+      status === 'ongoing'
+        ? 'bg-warning/15 text-warning'
+        : status === 'finished'
+        ? 'bg-success/15 text-success'
+        : /* hiatus */ 'bg-muted text-muted-foreground'
+    /* eslint-enable lingui/no-unlocalized-strings */
+    return (
+      <span className={cn('inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide leading-none', cls)}>
+        {SERIES_STATUS_LABELS[status] ? i18n._(SERIES_STATUS_LABELS[status]) : status}
+      </span>
+    )
+  }
+
+  async function markAllRead(books: SeriesDetailBook[]) {
+    if (markingAllRead) return
+    setMarkingAllRead(true)
+    try {
+      const unread = books.filter(b => b.reading_status !== 'read')
+      await Promise.all(unread.map(b => api.put(`/books/${b.id}/status`, { status: 'read' })))
+      // Refresh detail
+      if (expandedSeries) {
+        const detail = await api.get<SeriesDetail>(`/books/series-detail?name=${encodeURIComponent(expandedSeries)}`)
+        setSeriesDetail(detail)
+      }
+    } catch {
+      // silent
+    } finally {
+      setMarkingAllRead(false)
+    }
+  }
+
+  function toggleSort(field: SortField) {
+    if (sort === field) persistOrder(order === 'asc' ? 'desc' : 'asc')
+    else { persistSort(field); persistOrder('asc') }
+  }
+
+  // ── URL-based filters ─────────────────────────────────────────────────────
+  const search = searchParams.get('q') ?? ''
+  const filterSeries = searchParams.get('series') ?? ''
+  const filterNoSeries = searchParams.get('no_series') === 'true'
+  const filterAuthor = searchParams.get('author') ?? ''
+  const filterTag = searchParams.get('tag') ?? ''
+  const filterFormat = searchParams.get('format') ?? ''
+  const filterLanguage = searchParams.get('language') ?? ''
+  const filterLibrary = searchParams.get('library_id') ? Number(searchParams.get('library_id')) : null
+  const filterReadingStatus = searchParams.get('reading_status') ?? ''
+  const filterMinRating = searchParams.get('min_rating') ? Number(searchParams.get('min_rating')) : null
+  const filterMissing = searchParams.get('missing') ?? ''
+  const filterOwnership = searchParams.get('ownership') ?? ''
+  const filterAddedBy = searchParams.get('added_by') ? Number(searchParams.get('added_by')) : null
+
+  // ── User list for admin uploader filter ──────────────────────────────────
+  interface SimpleUser { id: number; username: string; role: string }
+  const [userList, setUserList] = useState<SimpleUser[]>([])
+  useEffect(() => {
+    if (isAdmin(user)) {
+      api.get<SimpleUser[]>('/users/list').then(setUserList).catch(() => {})
+    }
+  }, [user])
+
+  function setFilter(key: string, value: string, replace = false) {
+    setSearchParams(prev => {
+      const next = new URLSearchParams(prev)
+      // When changing a content filter, drop saved_filter reference
+      if (key !== 'library_id') next.delete('saved_filter')
+      if (value) next.set(key, value)
+      else next.delete(key)
+      return next
+    }, { replace })
+  }
+
+  function clearFilters() {
+    setSearchParams(prev => {
+      const next = new URLSearchParams()
+      const t = prev.get('tab')
+      if (t) next.set('tab', t)
+      return next
+    })
+  }
+
+  const hasFilters = !!(search || filterSeries || filterNoSeries || filterAuthor || filterTag || filterFormat || filterLanguage || filterReadingStatus || filterMinRating || filterMissing || filterOwnership || filterAddedBy)
+
+  // Grouping is bypassed while drilling into a specific series — the user
+  // explicitly asked for that series' volumes, so a single stack is useless.
+  const groupActive = groupBySeries && !filterSeries
+
+  // ── Debounced search ──────────────────────────────────────────────────────
+  const [searchInput, setSearchInput] = useState(search)
+  const searchDebounce = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  function handleSearchInput(val: string) {
+    setSearchInput(val)
+    clearTimeout(searchDebounce.current)
+    searchDebounce.current = setTimeout(() => {
+      setSearchParams(prev => {
+        const next = new URLSearchParams(prev)
+        next.delete('saved_filter')
+        if (val) {
+          next.set('q', val)
+          next.set('tab', 'books')
+        } else {
+          next.delete('q')
+        }
+        return next
+      }, { replace: true })
+    }, 300)
+  }
+  useEffect(() => { setSearchInput(search) }, [search])
+
+  // ── Multi-select + bulk actions ──────────────────────────────────────────
+  const [selectionMode, setSelectionMode] = useState(false)
+  const [selected, setSelected] = useState<Set<number>>(new Set())
+  const [bulkLibMenu, setBulkLibMenu] = useState(false)
+  const [bulkPending, setBulkPending] = useState(false)
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false)
+  const [bulkMetaOpen, setBulkMetaOpen] = useState(false)
+  const [bulkMetaAuthor, setBulkMetaAuthor] = useState('')
+  const [bulkMetaSeries, setBulkMetaSeries] = useState('')
+  const [bulkMetaTagsAdd, setBulkMetaTagsAdd] = useState<string[]>([])
+  const [bulkMetaTagInput, setBulkMetaTagInput] = useState('')
+  const [bulkMetaTypeId, setBulkMetaTypeId] = useState<number | ''>('')
+  const [bulkMetaSaving, setBulkMetaSaving] = useState(false)
+  const bookTypes = useBookTypes()
+
+  function toggleSelect(id: number, shiftKey: boolean) {
+    setSelected(prev => {
+      const index = books.findIndex(b => b.id === id)
+      return handleToggle(id, index, shiftKey, prev)
+    })
+  }
+  async function selectAll() {
+    // Select the whole filtered set, not just the pages the infinite scroll
+    // has loaded (issue #165 follow-up). Loaded books are selected instantly
+    // so the UI responds; the full id list replaces them when it arrives.
+    setSelected(new Set(books.map(b => b.id)))
+    try {
+      const res = await api.get<{ ids: number[] }>(`/books/ids?${buildFilterParams()}`)
+      setSelected(new Set(res.ids))
+    } catch {
+      // keep the loaded-books selection as fallback
+    }
+  }
+  function clearSelection() { setSelected(new Set()) }
+  function exitSelectionMode() { setSelectionMode(false); setSelected(new Set()) }
+
+  async function bulkDownload() {
+    if (!selected.size) return
+    setBulkPending(true)
+    try {
+      const token = localStorage.getItem('tome_token')
+      const resp = await fetch('/api/downloads', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ book_ids: [...selected] }),
+      })
+      if (!resp.ok) throw new Error('Download failed')
+      const blob = await resp.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'tome-books.zip'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : t`Download failed`)
+    } finally {
+      setBulkPending(false)
+    }
+  }
+
+  async function bulkAddToLibrary(libId: number) {
+    if (!selected.size) return
+    setBulkPending(true)
+    try {
+      await api.post(`/libraries/${libId}/books`, { book_ids: [...selected] })
+      toastSuccess(plural(selected.size, { one: 'Added # book to library', other: 'Added # books to library' }))
+      clearSelection()
+      setBulkLibMenu(false)
+      loadLibraries()
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : t`Failed`)
+    } finally {
+      setBulkPending(false)
+    }
+  }
+
+  async function bulkDelete() {
+    if (!selected.size) return
+    setBulkPending(true)
+    const ids = [...selected]
+    const CHUNK = 500 // server caps bulk-delete at 500 ids per request
+    let deleted = 0
+    let failed = 0
+    try {
+      for (let i = 0; i < ids.length; i += CHUNK) {
+        const res = await api.post<{ deleted: number[]; errors: { book_id: number; error: string }[] }>(
+          '/books/bulk-delete',
+          { book_ids: ids.slice(i, i + CHUNK) },
+        )
+        deleted += res.deleted.length
+        failed += res.errors.length
+      }
+      toastSuccess(plural(deleted, { one: 'Deleted # book', other: 'Deleted # books' }))
+      if (failed) {
+        toastError(plural(failed, { one: '# book could not be deleted', other: '# books could not be deleted' }))
+      }
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : t`Delete failed`)
+    }
+    setDeleteModalOpen(false)
+    clearSelection()
+    loadBooks()
+    setBulkPending(false)
+  }
+
+  async function bulkSaveMetadata() {
+    if (!selected.size) return
+    setBulkMetaSaving(true)
+    try {
+      const body: Record<string, unknown> = { book_ids: [...selected] }
+      if (bulkMetaAuthor) body.author = bulkMetaAuthor
+      if (bulkMetaSeries) body.series = bulkMetaSeries
+      if (bulkMetaTagsAdd.length) body.tags_add = bulkMetaTagsAdd
+      if (bulkMetaTypeId) body.book_type_id = bulkMetaTypeId
+      await api.put('/books/bulk-metadata', body)
+      toastSuccess(plural(selected.size, { one: 'Updated metadata for # book', other: 'Updated metadata for # books' }))
+      setBulkMetaOpen(false)
+      setBulkMetaAuthor(''); setBulkMetaSeries(''); setBulkMetaTagsAdd([]); setBulkMetaTypeId('')
+      clearSelection()
+      loadBooks(); loadFacets()
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : t`Failed to update metadata`)
+    } finally {
+      setBulkMetaSaving(false)
+    }
+  }
+
+  // ── Sidebar data ──────────────────────────────────────────────────────────
+  const { libraries, savedFilters, loadLibraries, loadSavedFilters } = useSidebarLists(user?.id)
+  // Cached across page mounts (see useSidebarLists) — this refetch only
+  // freshens the lists in the background, it never blanks them.
+  useEffect(() => { loadLibraries(); loadSavedFilters() }, [])
+
+  // ── Books + facets ────────────────────────────────────────────────────────
+  const [books, setBooks] = useState<Book[]>([])
+  const { handleToggle } = useShiftSelect(books.map(b => b.id))
+
+  const booksGridRef = useRef<HTMLDivElement | null>(null)
+  const [totalCount, setTotalCount] = useState<number | null>(null)
+  const [readingStatuses, setReadingStatuses] = useState<Record<number, { status: ReadingStatus; progress_pct: number | null; rating: number | null }>>({})
+  const [facets, setFacets] = useState<Facets>({ series: [], authors: [], tags: [], formats: [], languages: [] })
+  const [loading, setLoading] = useState(true)
+  const [uploadModalOpen, setUploadModalOpen] = useState(false)
+  const [filterOpen, setFilterOpen] = useState(false)
+
+  const { toast } = useToast()
+  const toastSuccess = toast.success
+  const toastError = toast.error
+  const searchInputRef = useRef<HTMLInputElement>(null)
+  const sentinelRef = useRef<HTMLDivElement>(null)
+  const booksRef = useRef<Book[]>([])
+  const abortRef = useRef<AbortController | null>(null)
+  const [hasMore, setHasMore] = useState(true)
+  const hasMoreRef = useRef(true)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [refreshing, setRefreshing] = useState(false)
+  const [continueReading, setContinueReading] = useState<Book[]>([])
+  const [homeStats, setHomeStats] = useState<HomeStats | null>(null)
+  const [readingDna, setReadingDna] = useState<ReadingDNA | null>(null)
+  // Home view mode: 'focus' = single-book Focus mode, 'dashboard' = the full grid.
+  const [homeMode, setHomeMode] = useState<'focus' | 'dashboard'>(
+    () => (localStorage.getItem('tome_home_mode') as 'focus' | 'dashboard') || 'dashboard'
+  )
+  const setHomeModePersisted = (m: 'focus' | 'dashboard') => {
+    localStorage.setItem('tome_home_mode', m)
+    setHomeMode(m)
+  }
+  const [recentlyFinished, setRecentlyFinished] = useState<Book[]>([])
+  const [recentlyAdded, setRecentlyAdded] = useState<Book[]>([])
+  const [activityLog, setActivityLog] = useState<ActivityEntry[]>([])
+  const [forgottenBooks, setForgottenBooks] = useState<ForgottenBook[]>([])
+  const [spotlight, setSpotlight] = useState<HighlightSpotlight | null>(null)
+  // Persisted dismissal: store the signature of the dismissed book set so the
+  // panel stays hidden across refreshes, but resurfaces if a new set appears.
+  const [forgottenDismissedSig, setForgottenDismissedSig] = useState<string>(
+    () => localStorage.getItem('tome_forgotten_dismissed') || ''
+  )
+  // Home hydration gate: the five above-the-fold fetches (stats, continue
+  // reading, finished, added, forgotten) count down here. Until all have
+  // settled the Home tab shows skeletons — never a false "Nothing in
+  // progress" empty state, and sections mount in one paint instead of
+  // inserting one by one and shifting the layout (CLS).
+  const [homeSettled, setHomeSettled] = useState(0)
+  const homeHydrated = homeSettled >= 5
+  const countSettled = () => setHomeSettled(n => n + 1)
+
+  const PAGE_SIZE = 60
+
+  function buildFilterParams(): URLSearchParams {
+    const params = new URLSearchParams()
+    if (search) params.set('q', search)
+    if (filterSeries) params.set('series', filterSeries)
+    if (filterNoSeries) params.set('no_series', 'true')
+    if (filterAuthor) params.set('author', filterAuthor)
+    if (filterTag) params.set('tag', filterTag)
+    if (filterFormat) params.set('format', filterFormat)
+    if (filterLanguage) params.set('language', filterLanguage)
+    if (filterLibrary) params.set('library_id', String(filterLibrary))
+    if (filterReadingStatus) params.set('reading_status', filterReadingStatus)
+    if (filterMinRating) params.set('min_rating', String(filterMinRating))
+    if (filterMissing) params.set('missing', filterMissing)
+    if (contentType) params.set('content_type', contentType)
+    if (filterOwnership) params.set('ownership', filterOwnership)
+    if (filterAddedBy) params.set('added_by', String(filterAddedBy))
+    return params
+  }
+
+  const loadBooks = useCallback((reset = true) => {
+    const skip = reset ? 0 : booksRef.current.length
+
+    if (reset) {
+      abortRef.current?.abort()
+      abortRef.current = new AbortController()
+      if (booksRef.current.length === 0) setLoading(true)
+      else setRefreshing(true)
+      hasMoreRef.current = true
+      setHasMore(true)
+    } else {
+      if (!hasMoreRef.current) return
+      setLoadingMore(true)
+    }
+
+    // Load-more requests share the reset's controller: a new reset (filter
+    // change, group toggle) aborts any in-flight page so its stale results
+    // can't be appended onto the fresh list (viewport-duplicates bug).
+    const signal = abortRef.current?.signal
+    const params = buildFilterParams()
+    params.set('sort', sort)
+    params.set('order', order)
+    params.set('skip', String(skip))
+    params.set('limit', String(PAGE_SIZE))
+    if (groupActive) params.set('group_by_series', 'true')
+    api.getWithHeaders<Book[]>(`/books?${params}`, signal)
+      .then(({ data: newBooks, headers }) => {
+        if (signal?.aborted) return
+        if (reset) {
+          const raw = headers.get('x-total-count')
+          setTotalCount(raw !== null ? Number(raw) : null)
+        }
+        let merged: Book[]
+        if (reset) {
+          merged = newBooks
+        } else {
+          const seen = new Set(booksRef.current.map(b => b.id))
+          merged = [...booksRef.current, ...newBooks.filter(b => !seen.has(b.id))]
+        }
+        booksRef.current = merged
+        setBooks(merged)
+        hasMoreRef.current = newBooks.length === PAGE_SIZE
+        setHasMore(newBooks.length === PAGE_SIZE)
+        if (newBooks.length > 0) {
+          api.post<Record<string, { status: string; progress_pct: number | null; rating: number | null }>>('/books/statuses', { book_ids: newBooks.map(b => b.id) })
+            .then(map => {
+              const s: Record<number, { status: ReadingStatus; progress_pct: number | null; rating: number | null }> = {}
+              Object.entries(map).forEach(([id, val]) => { s[Number(id)] = { status: val.status as ReadingStatus, progress_pct: val.progress_pct, rating: val.rating ?? null } })
+              setReadingStatuses(prev => ({ ...prev, ...s }))
+            })
+            .catch(() => {})
+        } else if (reset) {
+          setReadingStatuses({})
+        }
+      })
+      .catch(err => {
+        if (err instanceof Error && err.name === 'AbortError') return
+        toastError(t`Failed to load books`)
+      })
+      .finally(() => {
+        if (reset) {
+          // An aborted reset was superseded by a newer one that owns the
+          // loading flags — leave them alone.
+          if (signal?.aborted) return
+          setLoading(false)
+          setRefreshing(false)
+        } else {
+          // Always clear, even when aborted: this request is finished and a
+          // stuck loadingMore would stall the infinite scroll for good.
+          setLoadingMore(false)
+        }
+      })
+  }, [sort, order, search, filterSeries, filterNoSeries, filterAuthor, filterTag, filterFormat, filterLanguage, filterLibrary, filterReadingStatus, filterMinRating, filterMissing, contentType, filterOwnership, filterAddedBy, groupActive])
+
+  useEffect(() => { loadBooks() }, [loadBooks])
+
+  // Reset focused index when book list changes
+  useEffect(() => { setFocusedIndex(null) }, [books])
+
+  const loadingMoreRef = useRef(false)
+  useEffect(() => { loadingMoreRef.current = loadingMore }, [loadingMore])
+  const loadingRef = useRef(false)
+  useEffect(() => { loadingRef.current = loading }, [loading])
+  const refreshingRef = useRef(false)
+  useEffect(() => { refreshingRef.current = refreshing }, [refreshing])
+
+  const observerInstanceRef = useRef<IntersectionObserver | null>(null)
+  const sentinelCallback = useCallback((node: HTMLDivElement | null) => {
+    if (observerInstanceRef.current) {
+      observerInstanceRef.current.disconnect()
+      observerInstanceRef.current = null
+    }
+    sentinelRef.current = node
+    if (!node) return
+    const observer = new IntersectionObserver(entries => {
+      if (entries[0].isIntersecting && !loadingMoreRef.current && !loadingRef.current && !refreshingRef.current && hasMoreRef.current) {
+        loadBooks(false)
+      }
+    }, { rootMargin: '200px' })
+    observer.observe(node)
+    observerInstanceRef.current = observer
+  }, [loadBooks])
+
+  function loadFacets() { api.get<Facets>('/books/facets').then(setFacets).catch(() => {}) }
+  useEffect(() => { loadFacets() }, [])
+
+  // Mirror groupActive into a ref so the keydown handler (bound once) sees it
+  const groupActiveRef = useRef(false)
+  useEffect(() => { groupActiveRef.current = groupActive }, [groupActive])
+
+
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      const tag = (e.target as HTMLElement).tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+
+      if (e.key === '/') {
+        e.preventDefault()
+        searchInputRef.current?.focus()
+        return
+      }
+
+      if (e.key === 'j' || e.key === 'ArrowDown') {
+        e.preventDefault()
+        setFocusedIndex(prev => {
+          if (booksRef.current.length === 0) return null
+          if (prev === null) return 0
+          return (prev + 1) % booksRef.current.length
+        })
+        return
+      }
+
+      if (e.key === 'k' || e.key === 'ArrowUp') {
+        e.preventDefault()
+        setFocusedIndex(prev => {
+          if (booksRef.current.length === 0) return null
+          if (prev === null) return booksRef.current.length - 1
+          return (prev - 1 + booksRef.current.length) % booksRef.current.length
+        })
+        return
+      }
+
+      if (e.key === 'Enter') {
+        setFocusedIndex(prev => {
+          if (prev !== null && booksRef.current[prev]) {
+            const b = booksRef.current[prev]
+            if (groupActiveRef.current && b.series) {
+              navigate(`/?tab=series&series_detail=${encodeURIComponent(b.series)}`)
+            } else {
+              navigate(`/books/${b.id}`)
+            }
+          }
+          return prev
+        })
+        return
+      }
+
+      if (e.key === 'Escape') {
+        setFocusedIndex(prev => {
+          if (prev !== null) return null
+          searchInputRef.current?.blur()
+          return null
+        })
+        return
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [navigate])
+
+  useEffect(() => {
+    // status_updated = last reading activity, so the hero is the book you actually read last
+    api.get<Book[]>('/books?reading_status=reading&sort=status_updated&order=desc&limit=20')
+      .finally(countSettled)
+      .then(books => {
+        setContinueReading(books)
+        if (books.length > 0) {
+          api.post<Record<string, { status: string; progress_pct: number | null; rating: number | null }>>('/books/statuses', { book_ids: books.map(b => b.id) })
+            .then(map => {
+              const s: Record<number, { status: ReadingStatus; progress_pct: number | null; rating: number | null }> = {}
+              Object.entries(map).forEach(([id, val]) => { s[Number(id)] = { status: val.status as ReadingStatus, progress_pct: val.progress_pct, rating: val.rating ?? null } })
+              setReadingStatuses(prev => ({ ...prev, ...s }))
+            })
+            .catch(() => {})
+        }
+      })
+      .catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    const tzOffset = new Date().getTimezoneOffset()
+    api.get<HomeStats>(`/home/stats?tz_offset=${tzOffset}`).finally(countSettled).then(setHomeStats).catch(() => {})
+    api.get<Book[]>('/books?reading_status=read&sort=status_updated&order=desc&limit=6').finally(countSettled).then(setRecentlyFinished).catch(() => {})
+    api.get<Book[]>('/books?sort=added_at&order=desc&limit=6').finally(countSettled).then(setRecentlyAdded).catch(() => {})
+    api.get<ActivityEntry[]>('/home/activity').then(setActivityLog).catch(() => {})
+    api.get<ForgottenBook[]>('/home/forgotten-books').finally(countSettled).then(setForgottenBooks).catch(() => {})
+    api.get<HighlightSpotlight>('/annotations/spotlight').then(setSpotlight).catch(() => {})
+    api.get<SeriesItem[]>('/books/series').then(setSeriesList).catch(() => {})
+  }, [])
+
+  // Reading DNA is the costliest home request — fetch it lazily, only once the
+  // dashboard Home view (the one place the card renders) is actually shown.
+  useEffect(() => {
+    if (tab !== 'home' || homeMode !== 'dashboard' || readingDna) return
+    api.get<ReadingDNA>(`/home/reading-dna?tz_offset=${new Date().getTimezoneOffset()}`)
+      .then(setReadingDna)
+      .catch(() => {})
+  }, [tab, homeMode, readingDna])
+
+  // ── Filter chip helpers ───────────────────────────────────────────────────
+  const filterLibraryChipName = libraries.find(l => l.id === filterLibrary)?.name ?? t`Library`
+  const filterFormatUpper = filterFormat.toUpperCase()
+  const filterLanguageLabel = facets.languages.find(l => l.code === filterLanguage)?.label ?? filterLanguage
+  const filterStatusLabel = READING_STATUS_LABELS[filterReadingStatus] ? i18n._(READING_STATUS_LABELS[filterReadingStatus]) : filterReadingStatus
+  const filterMissingLabel = MISSING_LABELS[filterMissing] ? i18n._(MISSING_LABELS[filterMissing]) : filterMissing
+  const filterUploaderName = userList.find(u => u.id === filterAddedBy)?.username ?? filterAddedBy
+  const activeFilterChips: { label: string; key: string }[] = [
+    ...(filterLibrary ? [{ label: t`Library: ${filterLibraryChipName}`, key: 'library_id' }] : []),
+    ...(filterSeries ? [{ label: t`Series: ${filterSeries}`, key: 'series' }] : []),
+    ...(filterNoSeries ? [{ label: t`No Series`, key: 'no_series' }] : []),
+    ...(filterAuthor ? [{ label: t`Author: ${filterAuthor}`, key: 'author' }] : []),
+    ...(filterTag ? [{ label: t`Tag: ${filterTag}`, key: 'tag' }] : []),
+    ...(filterFormat ? [{ label: t`Format: ${filterFormatUpper}`, key: 'format' }] : []),
+    ...(filterLanguage ? [{ label: t`Language: ${filterLanguageLabel}`, key: 'language' }] : []),
+    ...(filterReadingStatus ? [{ label: t`Status: ${filterStatusLabel}`, key: 'reading_status' }] : []),
+    ...(filterMinRating ? [{ label: filterMinRating === 5 ? t`Rated: 5 stars` : t`Rated: ${filterMinRating}+ stars`, key: 'min_rating' }] : []),
+    ...(filterMissing ? [{ label: t`Missing: ${filterMissingLabel}`, key: 'missing' }] : []),
+    ...(filterOwnership === 'mine' ? [{ label: t`My Books`, key: 'ownership' }] : filterOwnership === 'shared' ? [{ label: t`Shared Library`, key: 'ownership' }] : []),
+    ...(filterAddedBy ? [{ label: t`Uploader: ${filterUploaderName}`, key: 'added_by' }] : []),
+  ]
+
+  // Params to pass to SaveFilterButton (excludes library_id — that belongs in sidebar)
+  const saveableParams: Record<string, string> = {}
+  if (search) saveableParams.q = search
+  if (filterSeries) saveableParams.series = filterSeries
+  if (filterAuthor) saveableParams.author = filterAuthor
+  if (filterTag) saveableParams.tag = filterTag
+  if (filterFormat) saveableParams.format = filterFormat
+  if (filterLanguage) saveableParams.language = filterLanguage
+
+  // Grid columns flow from the spring-smoothed cover size; card typography
+  // follows the slider value. view-fade covers the grid/list switch.
+  const cardView: ViewMode = view === 'list' ? 'list' : gridSize < 150 ? 'small' : 'large'
+  const gridClass = view === 'list'
+    // eslint-disable-next-line lingui/no-unlocalized-strings -- Tailwind classes
+    ? 'flex flex-col gap-2.5 animate-[view-fade_0.25s_ease-out]'
+    : cn(
+        'grid transition-[gap] duration-300 ease-out animate-[view-fade_0.25s_ease-out]',
+        gridSize < 150 ? 'gap-2' : 'gap-4'
+      )
+  // min(size, 42vw) keeps phones at two columns regardless of the slider —
+  // without it a 180px minimum fits only one track on a 390px screen
+  const gridStyle = view === 'list'
+    ? undefined
+    // eslint-disable-next-line lingui/no-unlocalized-strings -- CSS grid template
+    : { gridTemplateColumns: `repeat(auto-fill, minmax(min(${gridSize}px, 42vw), 1fr))` }
+
+  // Active library name for heading
+  const activeLibraryName = filterLibrary ? libraries.find(l => l.id === filterLibrary)?.name : null
+
+  // Home quick stats
+  const homeStatItems: { value: string; label: string; icon: ReactNode }[] = homeStats ? [
+    // A zero-day streak is a sad opener — only lead with it when it exists
+    ...(homeStats.current_streak_days > 0
+      ? [{ value: String(homeStats.current_streak_days), label: t`Day streak`, icon: <Flame className="w-5 h-5" /> }]
+      : []),
+    { value: String(homeStats.books_finished_30d), label: t`Finished · 30d`, icon: <BookCheck className="w-5 h-5" /> },
+    { value: formatReadingTime(homeStats.reading_seconds_30d), label: t`Read · 30d`, icon: <Clock className="w-5 h-5" /> },
+    { value: String(homeStats.pages_turned_30d), label: t`Pages · 30d`, icon: <BookOpenCheck className="w-5 h-5" /> },
+  ] : []
+
+  // Compact Focus / Dashboard switch — placed inline next to the KPI band in
+  // Dashboard mode, top-right on its own in Focus mode.
+  const modeToggle = (
+    <div className="flex w-full sm:inline-flex sm:w-auto rounded-lg border border-border bg-card p-0.5 sm:shrink-0">
+      {([
+        { id: 'focus', label: t`Focus`, icon: <Moon className="w-3.5 h-3.5" /> },
+        { id: 'dashboard', label: t`Dashboard`, icon: <LayoutGrid className="w-3.5 h-3.5" /> },
+      ] as const).map((m) => (
+        <button
+          key={m.id}
+          onClick={() => setHomeModePersisted(m.id)}
+          className={cn(
+            'flex-1 justify-center sm:flex-none sm:justify-start inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[13px] font-medium transition-colors',
+            homeMode === m.id ? 'bg-primary/15 text-foreground' : 'text-muted-foreground hover:text-foreground'
+          )}
+        >
+          {m.icon}
+          {m.label}
+        </button>
+      ))}
+    </div>
+  )
+
+  // h-dvh, not h-screen — see AppShell: 100vh overhangs mobile toolbars.
+  return (
+    <div className="h-dvh bg-background flex flex-col overflow-hidden">
+      {/* ── Navbar (shared with the standalone pages via AppShell) ───────── */}
+      <AppHeader
+        onMenuClick={() => setMobileSidebarOpen(true)}
+        search={
+          <HeaderSearch
+            value={searchInput}
+            onChange={handleSearchInput}
+            onClear={() => { setSearchInput(''); setFilter('q', '') }}
+            inputRef={searchInputRef}
+          />
+        }
+        onUploadClick={isMember(user) ? () => setUploadModalOpen(true) : undefined}
+      />
+
+      {shareSeries && (
+        <ShareModal
+          title={shareSeries}
+          endpoint={`/series/${encodeURIComponent(shareSeries)}/share`}
+          noun="series"
+          onClose={() => setShareSeries(null)}
+        />
+      )}
+      <UploadModal
+        isOpen={uploadModalOpen}
+        onClose={() => setUploadModalOpen(false)}
+        onDone={() => { loadBooks(); loadFacets() }}
+        onWishMatches={(wishIds) => {
+          const n = wishIds.length
+          toast.info(plural(n, {
+            one: 'This upload satisfies # wish — review in Admin > Wishlist',
+            other: 'This upload satisfies # wishes — review in Admin > Wishlist',
+          }))
+        }}
+      />
+
+      {manageSeriesOpen && expandedSeries && (
+        <ManageSeriesModal
+          seriesName={expandedSeries}
+          volumes={
+            seriesDetail
+              ? seriesDetail.books
+                  .map(b => b.series_index)
+                  .filter((n): n is number => n != null)
+              : []
+          }
+          onClose={() => setManageSeriesOpen(false)}
+          onSaved={() => {
+            // Refresh meta map and arcs for the open series
+            if (expandedSeries) {
+              api.get<SeriesMeta>(`/series/${encodeURIComponent(expandedSeries)}/meta`)
+                .then(m => setSeriesMetaMap(prev => ({ ...prev, [expandedSeries]: m.status })))
+                .catch(() => {})
+              api.get<Arc[]>(`/series/${encodeURIComponent(expandedSeries)}/arcs`)
+                .then(setSeriesArcs)
+                .catch(() => {})
+            }
+          }}
+        />
+      )}
+
+      {/* ── Body (sidebar + main) ────────────────────────────────────────── */}
+      <div className="flex flex-1 overflow-hidden">
+        <Sidebar
+          libraries={libraries}
+          savedFilters={savedFilters}
+          activeTab={tab}
+          onLibrariesChange={loadLibraries}
+          onSavedFiltersChange={loadSavedFilters}
+          onOpenSeriesView={openSeriesTab}
+          onOpenHomeView={() => setTab('home')}
+          mobileOpen={mobileSidebarOpen}
+          onMobileClose={() => setMobileSidebarOpen(false)}
+        />
+
+        {/* overflow-x-hidden: WebKit counts pre-transform layout boxes (e.g. the
+            focus rotary's scaled 540px stage) as scrollable overflow, letting the
+            content pan sideways on phones; Chromium doesn't, so test on Safari. */}
+        <main className="flex-1 overflow-y-auto overflow-x-hidden px-4 py-4 min-w-0 overscroll-contain">
+          {/* Section heading */}
+          {activeLibraryName && (
+            <h2 className="text-lg font-semibold mb-3">{activeLibraryName}</h2>
+          )}
+
+          {tab === 'home' ? (
+            /* ── Home tab ────────────────────────────────────────────────── */
+            <div className="flex flex-col gap-7">
+
+              {homeMode === 'focus' ? (
+              <>
+              {/* Focus mode: toggle alone, top-right */}
+              <div className="flex justify-end -mb-1">{modeToggle}</div>
+                <FocusMode />
+              </>
+              ) : (
+              <>
+
+              {/* ── Quick stats + mode toggle on one row ──────────────────── */}
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:flex-wrap">
+                <div className="flex flex-wrap items-stretch gap-3 empty:hidden w-full sm:w-auto">
+                  {/* Chromeless — the figures sit on the page itself. Boxing them
+                      gave the strip the same weight as the content panel below,
+                      and the dashboard read as four equal crates. */}
+                  {!homeStats && (
+                    /* Same footprint as the loaded strip so the row doesn't
+                       collapse-then-expand when stats arrive (layout shift). */
+                    <div className="px-1 py-1 grid grid-cols-3 gap-x-4 gap-y-3 sm:gap-x-0 sm:flex w-full sm:w-fit" aria-hidden="true">
+                      {[0, 1, 2].map(i => (
+                        <div key={i} className={cn('sm:px-5 animate-pulse', i === 0 && 'sm:pl-0')}>
+                          <div className="h-3 w-16 rounded bg-muted mb-1.5 mt-0.5" />
+                          <div className="h-6 w-14 rounded bg-muted" />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {homeStats && (
+                    <div className={cn(
+                      'px-1 py-1 grid gap-x-4 gap-y-3 sm:gap-x-0 sm:flex w-full sm:w-fit',
+                      /* Three chips wrap 2+1 on phones and look ragged — give an
+                         odd count three even columns instead. */
+                      homeStatItems.length === 3 ? 'grid-cols-3' : 'grid-cols-2'
+                    )}>
+                      {homeStatItems.map((s, i) => (
+                        <div
+                          key={s.label}
+                          className={cn(
+                            'sm:px-5',
+                            i === 0 && 'sm:pl-0',
+                            i > 0 && 'sm:border-l sm:border-border/60'
+                          )}
+                        >
+                          <p className="text-xs text-muted-foreground/70">{s.label}</p>
+                          <p className="flex items-center gap-2 text-xl font-semibold tabular-nums text-foreground leading-tight">
+                            <span className="text-primary/60">{s.icon}</span>
+                            {s.value}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <div className="w-full sm:w-auto sm:ml-auto">{modeToggle}</div>
+              </div>
+
+              {/* ── Two-column body: content + rail ───────────────────────── */}
+              <div className="flex flex-col gap-8 lg:grid lg:grid-cols-[minmax(0,1fr)_320px] lg:gap-7 lg:items-start">
+              {/* ── Main column (one connected panel, hairline-divided) ──────
+                  The ONE bordered, elevated surface on the page — the rail and
+                  stat strip deliberately carry less chrome so this reads primary. */}
+              <div className="rounded-2xl border border-border bg-card shadow-sm divide-y divide-border min-w-0 overflow-hidden">
+
+              {!homeHydrated ? (
+                /* Skeleton until every above-the-fold fetch has settled — the
+                   real sections then mount in a single paint. Rendering the
+                   empty state before data resolves flashed "Nothing in
+                   progress" at every cold load (UX sweep finding, CLS 0.27). */
+                <div aria-busy="true">
+                  <section className="flex flex-col gap-3 px-5 py-5">
+                    <div className="h-5 w-40 rounded bg-muted animate-pulse" />
+                    <div className="flex gap-4 overflow-hidden pb-2">
+                      {[...Array(6)].map((_, i) => (
+                        <div key={i} className="shrink-0 w-32 animate-pulse">
+                          <div className="aspect-[2/3] rounded-lg bg-muted" />
+                          <div className="h-3 w-24 rounded bg-muted mt-2" />
+                          <div className="h-2.5 w-16 rounded bg-muted mt-1.5" />
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                  <section className="flex flex-col gap-3 px-5 py-5 border-t border-border">
+                    <div className="h-5 w-32 rounded bg-muted animate-pulse" />
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      {[...Array(4)].map((_, i) => (
+                        <div key={i} className="h-14 rounded-xl bg-muted/60 animate-pulse" />
+                      ))}
+                    </div>
+                  </section>
+                </div>
+              ) : (
+              <>
+
+              {/* ── Forgotten Books ───────────────────────────────────────── */}
+              {(() => {
+                const forgottenSig = forgottenBooks.map(b => b.book_id).sort((a, b) => a - b).join(',')
+                const showForgotten = forgottenBooks.length > 0 && forgottenSig !== forgottenDismissedSig
+                if (!showForgotten) return null
+                const dismiss = () => {
+                  localStorage.setItem('tome_forgotten_dismissed', forgottenSig)
+                  setForgottenDismissedSig(forgottenSig)
+                }
+                return (
+                  <section className="px-5 py-4">
+                    <header className="flex items-center justify-between mb-2">
+                      <h2 className="text-base text-foreground"><Trans>Pick up where you left off</Trans></h2>
+                      <button
+                        onClick={dismiss}
+                        className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+                      >
+                        <Trans>Dismiss</Trans>
+                      </button>
+                    </header>
+                    <HScrollRow className="gap-3 pb-1" controlsTop="top-[60px]">
+                      {forgottenBooks.map(b => (
+                        <a
+                          key={b.book_id}
+                          href={`/books/${b.book_id}`}
+                          className="group flex flex-col gap-1 w-20 shrink-0 hover:opacity-90 transition-opacity"
+                        >
+                          <div className="relative aspect-[2/3] rounded-md bg-muted overflow-hidden">
+                            <CoverImage
+                              src={b.has_cover ? `/api/books/${b.book_id}/cover` : null}
+                              alt={b.title}
+                              iconClassName="w-5 h-5"
+                            />
+                          </div>
+                          <p className="text-[11px] font-medium text-foreground truncate group-hover:text-primary transition-colors">
+                            {b.title}
+                          </p>
+                          <p className="text-[10px] text-muted-foreground">
+                            {(() => { const d = b.days_ago; return d != null ? t`${d}d ago` : t`A while ago` })()}
+                          </p>
+                        </a>
+                      ))}
+                    </HScrollRow>
+                  </section>
+                )
+              })()}
+
+              {/* ── Continue Reading ──────────────────────────────────────── */}
+              <section className="flex flex-col gap-3 px-5 py-5">
+                <h2 className="text-base font-semibold text-foreground"><Trans>Continue Reading</Trans></h2>
+                {continueReading.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center py-24 gap-4 text-center">
+                    <div className="w-16 h-16 rounded-2xl bg-primary/10 flex items-center justify-center">
+                      <BookOpen className="w-8 h-8 text-primary/40" />
+                    </div>
+                    <div>
+                      <p className="text-base font-medium text-foreground"><Trans>Nothing in progress</Trans></p>
+                      <p className="text-sm text-muted-foreground mt-1"><Trans>Start reading and your progress will show up here</Trans></p>
+                    </div>
+                    <button onClick={() => setTab('books')} className="text-sm text-primary hover:underline">
+                      <Trans>Browse your library</Trans>
+                    </button>
+                  </div>
+                ) : (
+                  /* Horizontal band (not a grid): one scrollable row keeps Home's
+                     left column on a consistent banded rhythm that aligns with the
+                     rail, instead of a tall wall of covers. */
+                  <HScrollRow className="gap-4 pb-2 px-1" wrapClassName="-mx-1" controlsTop="top-24">
+                    {continueReading.map((book, i) => {
+                      const status = readingStatuses[book.id]
+                      return (
+                        <div key={book.id} className="shrink-0 w-32">
+                          <BookCard
+                            book={book}
+                            view="small"
+                            index={i}
+                            selected={false}
+                            readingStatus={status?.status}
+                            progressPct={status?.progress_pct}
+                            rating={status?.rating}
+                            showFormatBadge={false}
+                          />
+                        </div>
+                      )
+                    })}
+                  </HScrollRow>
+                )}
+              </section>
+
+              {/* ── Series Progress ───────────────────────────────────────── */}
+              {(() => {
+                // One card per series (a series can have several in-progress volumes),
+                // ranked by how far through it you are. Progress = completed volumes /
+                // total, so it never reads "Book 1171 of 17" off a chapter index.
+                const bySeries = new Map<string, { book: typeof continueReading[number]; read: number; total: number | null; pct: number }>()
+                for (const book of continueReading) {
+                  if (!book.series || book.series_index == null || bySeries.has(book.series)) continue
+                  const sd = seriesList.find(s => s.name === book.series)
+                  const total = sd?.book_count ?? null
+                  const read = sd?.read_count ?? 0
+                  bySeries.set(book.series, { book, read, total, pct: total ? Math.min(100, (read / total) * 100) : 0 })
+                }
+                // Only series with genuine momentum: at least one completed volume
+                // and not yet finished. Just-started (0%) series live in Continue
+                // Reading; finished ones don't belong here. Most-progressed first.
+                const rows = [...bySeries.values()]
+                  .filter(r => r.read > 0 && (r.total == null || r.read < r.total))
+                  .sort((a, b) => b.pct - a.pct)
+                  .slice(0, 6)
+                if (rows.length === 0) return null
+                return (
+                  <div className="flex flex-col gap-3 px-5 py-5">
+                    <h2 className="text-base font-semibold text-foreground"><Trans>Series Progress</Trans></h2>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      {rows.map(({ book, read, total, pct }) => (
+                        <button
+                          key={book.series}
+                          type="button"
+                          onClick={() => setSearchParams({ tab: 'books', series: book.series! })}
+                          className="group flex items-center gap-3 px-3 py-2.5 rounded-xl bg-muted/40 hover:bg-muted/60 transition-colors text-left"
+                        >
+                          <div className="relative w-9 aspect-[2/3] rounded shrink-0 overflow-hidden bg-muted">
+                            <CoverImage src={book.cover_path ? `/api/books/${book.id}/cover` : null} alt={book.series!} iconClassName="w-4 h-4" />
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center justify-between gap-2 mb-1.5">
+                              <span className="text-xs font-medium text-foreground truncate group-hover:text-primary transition-colors">{book.series}</span>
+                              <span className="text-[11px] text-muted-foreground shrink-0 tabular-nums">{total ? `${read}/${total}` : `${read}`}</span>
+                            </div>
+                            <div className="h-1.5 rounded-full bg-muted overflow-hidden">
+                              <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${pct}%` }} />
+                            </div>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )
+              })()}
+
+              {/* ── Recently Finished ─────────────────────────────────────── */}
+              {recentlyFinished.length > 0 && (
+                <section className="flex flex-col gap-3 px-5 py-5">
+                  <h2 className="text-base font-semibold text-foreground"><Trans>Recently Finished</Trans></h2>
+                  <HScrollRow className="gap-3 pb-1 px-1" wrapClassName="-mx-1" controlsTop="top-[72px]">
+                    {recentlyFinished.map(book => (
+                      <div key={book.id} className="shrink-0 w-24">
+                        <BookCard
+                          book={book}
+                          view="small"
+                          index={0}
+                          selected={false}
+                          readingStatus="read"
+                          rating={readingStatuses[book.id]?.rating}
+                          showFormatBadge={false}
+                        />
+                      </div>
+                    ))}
+                  </HScrollRow>
+                </section>
+              )}
+
+              {/* ── Recently Added ────────────────────────────────────────── */}
+              {recentlyAdded.length > 0 && (
+                <section className="flex flex-col gap-3 px-5 py-5">
+                  <h2 className="text-base font-semibold text-foreground"><Trans>Recently Added</Trans></h2>
+                  <HScrollRow className="gap-3 pb-1 px-1" wrapClassName="-mx-1" controlsTop="top-[72px]">
+                    {recentlyAdded.map(book => (
+                      <div key={book.id} className="shrink-0 w-24">
+                        <BookCard
+                          book={book}
+                          view="small"
+                          index={0}
+                          selected={false}
+                          readingStatus={readingStatuses[book.id]?.status}
+                          progressPct={readingStatuses[book.id]?.progress_pct}
+                          rating={readingStatuses[book.id]?.rating}
+                          showFormatBadge={false}
+                        />
+                      </div>
+                    ))}
+                  </HScrollRow>
+                </section>
+              )}
+
+              {/* ── Reading Log ───────────────────────────────────────────── */}
+              {activityLog.length > 0 && (
+                <div className="flex flex-col gap-3 px-5 py-5">
+                  <h2 className="text-base font-semibold text-foreground"><Trans>Reading Log</Trans></h2>
+                  <div className="flex flex-col gap-1">
+                    {(() => {
+                      // Back-to-back sessions of the same book collapse into one row
+                      // ("3 sessions · 1h 08m") under a day header — five raw
+                      // "Press Start" lines in a row said less than one merged one.
+                      const sameDay = (a: string, b: string) => new Date(a).toDateString() === new Date(b).toDateString()
+                      const dayLabel = (iso: string) => {
+                        const d = new Date(iso)
+                        const today = new Date()
+                        const yesterday = new Date(today)
+                        yesterday.setDate(today.getDate() - 1)
+                        if (d.toDateString() === today.toDateString()) return t`Today`
+                        if (d.toDateString() === yesterday.toDateString()) return t`Yesterday`
+                        return d.toLocaleDateString(i18n.locale, { weekday: 'short', month: 'short', day: 'numeric' })
+                      }
+                      type LogRow = { entry: ActivityEntry; sessions: number; seconds: number }
+                      const days: { label: string; first: string; rows: LogRow[] }[] = []
+                      for (const entry of activityLog) {
+                        let day = days[days.length - 1]
+                        if (!day || !sameDay(day.first, entry.started_at)) {
+                          day = { label: dayLabel(entry.started_at), first: entry.started_at, rows: [] }
+                          days.push(day)
+                        }
+                        const last = day.rows[day.rows.length - 1]
+                        if (last && last.entry.book_id === entry.book_id) {
+                          last.sessions += 1
+                          last.seconds += entry.duration_seconds
+                        } else {
+                          day.rows.push({ entry, sessions: 1, seconds: entry.duration_seconds })
+                        }
+                      }
+                      return days.map(day => (
+                        <div key={day.first} className="flex flex-col gap-1">
+                          <p className="px-3 pt-2 pb-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                            {day.label}
+                          </p>
+                          {day.rows.map(({ entry, sessions, seconds }) => (
+                            <Link
+                              key={entry.started_at}
+                              to={`/books/${entry.book_id}`}
+                              className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-muted/50 transition-colors"
+                            >
+                              <div className="relative w-8 h-11 rounded overflow-hidden shrink-0 border border-border">
+                                <CoverImage
+                                  src={entry.book_cover_path ? `/api/books/${entry.book_id}/cover` : null}
+                                  alt={entry.book_title}
+                                  iconClassName="w-3.5 h-3.5"
+                                />
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <p className="text-xs font-medium text-foreground truncate">{entry.book_title}</p>
+                                <p className="text-[10px] text-muted-foreground">
+                                  {(() => {
+                                    const time = formatReadingTime(seconds)
+                                    return sessions > 1 ? t`${sessions} sessions · ${time}` : time
+                                  })()}
+                                </p>
+                              </div>
+                              <span className="text-[10px] text-muted-foreground shrink-0">
+                                {new Date(entry.started_at).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}
+                              </span>
+                            </Link>
+                          ))}
+                        </div>
+                      ))
+                    })()}
+                  </div>
+                </div>
+              )}
+
+              </>
+              )}
+
+              </div>{/* ── /Main column ── */}
+
+              {/* ── Right rail (one connected panel, hairline-divided) ───────
+                  empty:hidden — every child is conditional (no sessions / no
+                  goals / no highlights), and a brand-new user would otherwise
+                  see a bare bordered box. */}
+              <aside className="rounded-2xl bg-muted/40 divide-y divide-border/60 overflow-hidden empty:hidden">
+                {readingDna && <ReadingDNACard dna={readingDna} />}
+                <HomeGoalRings />
+                <UpcomingReleases />
+                {spotlight?.highlight?.highlighted_text && (
+                  <section className="p-4">
+                    <header className="flex items-center justify-between mb-2.5">
+                      <h2 className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
+                        <Quote className="w-4 h-4 text-primary/60" />
+                        {spotlight.on_this_day ? t`On this day` : t`From your highlights`}
+                      </h2>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => {
+                            const cur = spotlight.highlight?.id
+                            api.get<HighlightSpotlight>(
+                              `/annotations/spotlight${cur ? `?exclude=${cur}` : ''}`
+                            ).then(setSpotlight).catch(() => {})
+                          }}
+                          title={t`Show another highlight`}
+                          aria-label={t`Show another highlight`}
+                          className="p-1 rounded text-muted-foreground hover:text-foreground transition-colors"
+                        >
+                          <Shuffle className="w-3.5 h-3.5" />
+                        </button>
+                        <a href="/highlights" className="text-xs text-muted-foreground hover:text-foreground transition-colors">
+                          <Trans>All →</Trans>
+                        </a>
+                      </div>
+                    </header>
+                    <a href={`/books/${spotlight.highlight.book_id}`} className="block group">
+                      <p className="text-sm text-foreground leading-relaxed border-l-2 border-primary/40 pl-3 italic line-clamp-4">
+                        {spotlight.highlight.highlighted_text}
+                      </p>
+                      <p className="mt-2 pl-3 text-xs text-muted-foreground group-hover:text-primary transition-colors">
+                        — {spotlight.highlight.book_title}
+                        {spotlight.highlight.book_author ? `, ${spotlight.highlight.book_author}` : ''}
+                      </p>
+                    </a>
+                  </section>
+                )}
+              </aside>
+
+              </div>{/* ── /Two-column body ── */}
+              </>
+              )}
+            </div>
+          ) : tab === 'series' ? (
+            /* ── Series grid ─────────────────────────────────────────────── */
+            <>
+            <div className="flex items-center gap-1 mb-5 text-sm text-muted-foreground">
+              <button
+                onClick={() => setTab('books')}
+                className="flex items-center gap-1 hover:text-foreground transition-colors shrink-0"
+              >
+                <Home className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline"><Trans>Library</Trans></span>
+              </button>
+              <ChevronRight className="w-3.5 h-3.5 opacity-30 shrink-0" />
+              {expandedSeries ? (
+                <>
+                  <button
+                    onClick={() => { setExpandedSeries(null); setSeriesDetail(null) }}
+                    className="hover:text-foreground transition-colors"
+                  >
+                    <Trans>Series</Trans>
+                  </button>
+                  <ChevronRight className="w-3.5 h-3.5 opacity-30 shrink-0" />
+                  <span className="font-medium text-foreground truncate max-w-[200px] sm:max-w-[300px]">{expandedSeries}</span>
+                </>
+              ) : (
+                <span className="font-medium text-foreground"><Trans>Series</Trans></span>
+              )}
+            </div>
+            {seriesLoading ? (
+              <div className="flex justify-center py-24">
+                <BookAnimation variant="refresh" className="block w-10 h-10 text-primary" />
+              </div>
+            ) : seriesList.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-24 gap-3 text-muted-foreground">
+                <BookOpen className="w-12 h-12 opacity-20" />
+                <p className="text-sm"><Trans>No series found — add series metadata to your books.</Trans></p>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-4">
+                {/* Series detail panel — replaces grid when a series is selected */}
+                {expandedSeries ? (
+                  <div className="rounded-xl border border-border bg-card overflow-hidden">
+                    {seriesDetailLoading || !seriesDetail ? (
+                      <div className="flex justify-center py-12">
+                        <Loader2 className="w-5 h-5 animate-spin text-primary" />
+                      </div>
+                    ) : (
+                      <div className="p-5 flex flex-col gap-5">
+                        {/* Header */}
+                        <div className="flex flex-col sm:flex-row sm:items-start gap-4">
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <h2 className="text-xl sm:text-2xl font-bold text-foreground leading-tight">{seriesDetail.name}</h2>
+                              <SeriesStatusBadge status={seriesMetaMap[seriesDetail.name]} />
+                              {seriesDetail.name !== '__unserialized__' && (
+                                <button
+                                  onClick={() => setShareSeries(seriesDetail.name)}
+                                  title={t`Share this series — a public metadata-only page`}
+                                  className="p-1.5 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                                >
+                                  <Share2 className="w-4 h-4" />
+                                </button>
+                              )}
+                            </div>
+                            {seriesDetail.author && (
+                              <p className="text-sm text-muted-foreground mt-0.5">{seriesDetail.author}</p>
+                            )}
+                            <SeriesRating
+                              seriesName={seriesDetail.name}
+                              isUnserialized={seriesDetail.name === '__unserialized__'}
+                            />
+                            {(() => {
+                              const total = seriesDetail.books.length
+                              const readCount = seriesDetail.books.filter(b => b.reading_status === 'read').length
+                              const readingCount = seriesDetail.books.filter(b => b.reading_status === 'reading').length
+                              const readPct = total ? (readCount / total) * 100 : 0
+                              const readingPct = total ? (readingCount / total) * 100 : 0
+                              return (
+                                <div className="mt-3">
+                                  <div className="flex items-center justify-between text-[10px] text-muted-foreground mb-1">
+                                    {(() => { const unreadCount = total - readCount - readingCount; return (
+                                      <span><Trans>{readCount} read &middot; {readingCount} reading &middot; {unreadCount} unread</Trans></span>
+                                    ) })()}
+                                    <span><Plural value={total} one="# volume" other="# volumes" /></span>
+                                  </div>
+                                  {seriesDetail.backlog && seriesDetail.backlog.estimated > 0 && (
+                                    <p className="text-[10px] text-muted-foreground mb-1.5" title={describePace(seriesDetail.backlog.pace, seriesDetail.backlog.by_type.some(t => t.type_avg > 0) ? 'type_avg' : 'words')}>
+                                      {(() => { const dur = formatEstimateHours(seriesDetail.backlog.seconds); return (
+                                        <Trans><span className="text-foreground font-medium tabular-nums">{dur}</span> left in this series</Trans>
+                                      ) })()}
+                                      {seriesDetail.backlog.days != null && (() => { const d = formatEstimateDays(seriesDetail.backlog.days); return <Trans> &middot; {d} at your pace</Trans> })()}
+                                      {seriesDetail.backlog.unestimated > 0 && (() => { const n = seriesDetail.backlog.unestimated; return <Trans> &middot; {n} not estimated</Trans> })()}
+                                    </p>
+                                  )}
+                                  <div className="h-2 rounded-full bg-muted overflow-hidden flex">
+                                    <div className="h-full bg-primary transition-all" style={{ width: `${readPct}%` }} />
+                                    <div className="h-full bg-primary/50 transition-all" style={{ width: `${readingPct}%` }} />
+                                  </div>
+                                </div>
+                              )
+                            })()}
+                            {seriesDetail.description && (
+                              <div className="mt-3">
+                                <p className={cn(
+                                  "text-xs text-muted-foreground leading-relaxed whitespace-pre-line",
+                                  !seriesDescExpanded && "line-clamp-3"
+                                )}>
+                                  {seriesDetail.description}
+                                </p>
+                                {seriesDetail.description.length > 240 && (
+                                  <button
+                                    onClick={() => setSeriesDescExpanded(v => !v)}
+                                    className="text-xs font-medium text-primary hover:opacity-80 mt-1 transition-opacity"
+                                  >
+                                    {seriesDescExpanded ? t`Show less` : t`Show more`}
+                                  </button>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0 flex-wrap">
+                            {(() => {
+                              const continueBook = getContinueBook(seriesDetail.books)
+                              if (!continueBook) return null
+                              const volIdx = continueBook.series_index
+                              const volLabel = volIdx != null ? t`Vol. ${volIdx}` : continueBook.title
+                              const isResuming = continueBook.reading_status === 'reading'
+                              return (
+                                <button
+                                  onClick={() => navigate(`/reader/${continueBook.id}`)}
+                                  className="flex items-center gap-2 px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition-opacity"
+                                >
+                                  <Play className="w-3.5 h-3.5" />
+                                  {isResuming ? t`Resume ${volLabel}` : t`Start ${volLabel}`}
+                                </button>
+                              )
+                            })()}
+                            <button
+                              onClick={() => markAllRead(seriesDetail.books)}
+                              disabled={markingAllRead || seriesDetail.books.every(b => b.reading_status === 'read')}
+                              className="flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-card text-sm font-medium text-foreground hover:bg-muted disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                            >
+                              {markingAllRead ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCheck className="w-3.5 h-3.5" />}
+                              <Trans>Mark all read</Trans>
+                            </button>
+                            {isAdmin(user) && (
+                              <button
+                                onClick={() => setManageSeriesOpen(true)}
+                                className="flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-card text-sm font-medium text-foreground hover:bg-muted transition-all"
+                                title={t`Manage series`}
+                              >
+                                <Settings2 className="w-3.5 h-3.5" />
+                                <Trans>Manage</Trans>
+                              </button>
+                            )}
+                            <SeriesFollowButton seriesName={seriesDetail.name} />
+                          </div>
+                        </div>
+
+                        {/* Per-series reading stats */}
+                        <SeriesReadingStats seriesName={seriesDetail.name} />
+
+                        {/* Volume grid — grouped by arc when arcs exist */}
+                        {(() => {
+                          const sections = groupVolumesByArc(seriesDetail.books, seriesArcs)
+                          const hasArcs = seriesArcs.length > 0
+                          return (
+                            <div className="flex flex-col gap-5">
+                              {sections.map((section, si) => (
+                                <div key={si} className="flex flex-col gap-2">
+                                  {hasArcs && (
+                                    <div className="flex items-center gap-3">
+                                      <span className="text-xs font-semibold text-foreground whitespace-nowrap">{section.label}</span>
+                                      <div className="flex-1 h-px bg-border" />
+                                    </div>
+                                  )}
+                                  {hasArcs && section.description && (
+                                    <p className="text-[11px] text-muted-foreground -mt-1">{section.description}</p>
+                                  )}
+                                  <div className="grid grid-cols-5 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-10 gap-2">
+                                    {section.volumes.map(vol => (
+                                      <div
+                                        key={vol.id}
+                                        onClick={() => navigate(`/books/${vol.id}`)}
+                                        title={vol.title}
+                                        className="group relative flex flex-col rounded-lg overflow-hidden border bg-muted transition-all duration-150 hover:shadow-md hover:scale-105 cursor-pointer"
+                                        style={{
+                                          borderColor: vol.reading_status === 'read'
+                                            ? 'color-mix(in oklab, var(--primary) 60%, transparent)'
+                                            : vol.reading_status === 'reading'
+                                            ? 'color-mix(in oklab, var(--primary) 30%, transparent)'
+                                            : undefined,
+                                        }}
+                                      >
+                                        <div className="relative aspect-[2/3] w-full overflow-hidden">
+                                          <CoverImage
+                                            src={vol.cover_path ? `/api/books/${vol.id}/cover` : null}
+                                            alt={vol.title}
+                                            iconClassName="w-4 h-4"
+                                          />
+                                          {/* Quick-read play button — top-left corner on hover */}
+                                          <button
+                                            onClick={e => { e.stopPropagation(); navigate(`/reader/${vol.id}`) }}
+                                            className="absolute top-1 left-1 opacity-0 group-hover:opacity-100 transition-opacity z-10"
+                                            title={t`Read`}
+                                            aria-label={t`Read`}
+                                          >
+                                            <div className="w-5 h-5 rounded-full bg-white/90 flex items-center justify-center shadow">
+                                              <Play className="w-2.5 h-2.5 text-black fill-black ml-px" />
+                                            </div>
+                                          </button>
+                                          {/* Status dot */}
+                                          {vol.reading_status !== 'unread' && (
+                                            <div className={cn(
+                                              'absolute top-1 right-1 w-2 h-2 rounded-full ring-1 ring-background',
+                                              vol.reading_status === 'read' ? 'bg-primary' : 'bg-primary/60'
+                                            )} />
+                                          )}
+                                          {/* Volume number overlay */}
+                                          {vol.series_index != null && (
+                                            <div className="absolute bottom-0 inset-x-0 bg-black/60 px-1 py-0.5">
+                                              {(() => { const idx = vol.series_index; return (
+                                              <span className="text-[9px] font-bold text-white leading-none">
+                                                <Trans>Vol. {idx}</Trans>
+                                              </span>
+                                              ) })()}
+                                            </div>
+                                          )}
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          )
+                        })()}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  /* Series card grid */
+                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
+                    {seriesList.map(s => {
+                      const isUnserialized = s.name === '__unserialized__'
+                      return (
+                        <button
+                          key={s.name}
+                          onClick={() => {
+                            if (isUnserialized) {
+                              setSearchParams(prev => {
+                                const p = new URLSearchParams(prev)
+                                p.set('tab', 'books')
+                                p.delete('saved_filter')
+                                p.set('no_series', 'true')
+                                return p
+                              })
+                            } else {
+                              openSeriesDetail(s.name)
+                            }
+                          }}
+                          className="group flex flex-col text-left rounded-xl overflow-hidden border border-border bg-card hover:border-primary/40 hover:shadow-md transition-all duration-150"
+                        >
+                          <div className="relative aspect-[2/3] bg-muted overflow-hidden">
+                            <CoverImage
+                              src={s.cover_book_id ? `/api/books/${s.cover_book_id}/cover` : null}
+                              alt={isUnserialized ? t`Unserialized` : s.name}
+                              imgClassName="group-hover:scale-105"
+                            />
+                            <div className="absolute bottom-0 inset-x-0 bg-gradient-to-t from-black/70 to-transparent px-2 pt-6 pb-2">
+                              <span className="text-[10px] font-semibold text-white/90">
+                                <Plural value={s.book_count} one="# book" other="# books" />
+                              </span>
+                            </div>
+                          </div>
+                          <div className="px-3 py-2.5 flex flex-col gap-0.5 min-w-0">
+                            <div className="flex items-start gap-1.5 flex-wrap">
+                              <span className="text-xs font-semibold text-foreground leading-tight line-clamp-2">
+                                {isUnserialized ? t`No Series` : s.name}
+                              </span>
+                              {!isUnserialized && <SeriesStatusBadge status={seriesMetaMap[s.name]} />}
+                            </div>
+                            {!isUnserialized && s.author && <span className="text-[10px] text-muted-foreground truncate">{s.author}</span>}
+                            {!isUnserialized && s.rating != null && (
+                              <StarRating value={s.rating} readOnly starClassName="w-3 h-3" className="mt-0.5" />
+                            )}
+                            {!isUnserialized && s.description && (
+                              <p className="text-[10px] text-muted-foreground leading-snug line-clamp-2 mt-0.5">{s.description}</p>
+                            )}
+                            {isUnserialized && (
+                              <p className="text-[10px] text-muted-foreground leading-snug mt-0.5"><Trans>Books without a series</Trans></p>
+                            )}
+                            {!isUnserialized && s.book_count > 0 && (s.read_count > 0 || s.reading_count > 0) && (
+                              <div className="mt-1.5 h-1 rounded-full bg-muted overflow-hidden flex">
+                                <div
+                                  className="h-full bg-primary"
+                                  style={{ width: `${(s.read_count / s.book_count) * 100}%` }}
+                                />
+                                <div
+                                  className="h-full bg-primary/50"
+                                  style={{ width: `${(s.reading_count / s.book_count) * 100}%` }}
+                                />
+                              </div>
+                            )}
+                          </div>
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+            )
+            }
+            </>
+          ) : (
+          <>
+
+          <div className="flex items-center gap-2 mb-3 flex-wrap">
+            <div className="flex items-center gap-1 bg-muted rounded-lg p-0.5">
+              {(Object.keys(SORT_LABELS) as SortField[]).map(f => (
+                <button key={f} onClick={() => toggleSort(f)}
+                  className={cn(
+                    'flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium transition-all',
+                    sort === f ? 'bg-primary/10 text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground'
+                  )}>
+                  {i18n._(SORT_LABELS[f])}
+                  {sort === f && (order === 'asc' ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />)}
+                </button>
+              ))}
+            </div>
+
+            <button
+              onClick={() => setFilterOpen(o => !o)}
+              className={cn(
+                'flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-all',
+                filterOpen || hasFilters
+                  ? 'border-primary/40 bg-primary/5 text-primary'
+                  : 'border-border bg-card text-muted-foreground hover:text-foreground hover:bg-muted'
+              )}>
+              <SlidersHorizontal className="w-3.5 h-3.5" />
+              <Trans>Filters</Trans>
+              {hasFilters && (
+                <span className="ml-0.5 w-4 h-4 rounded-full bg-primary text-primary-foreground text-[9px] flex items-center justify-center font-bold">
+                  {activeFilterChips.length}
+                </span>
+              )}
+            </button>
+
+            {/* Save filter button — only when content filters active (not library) */}
+            <SaveFilterButton params={saveableParams} onSaved={loadSavedFilters} />
+
+            {activeFilterChips.map(f => (
+              <span key={f.key} className="flex items-center gap-1 px-2 py-1 rounded-full text-xs bg-primary/10 text-primary border border-primary/20">
+                {f.label}
+                <button onClick={() => setFilter(f.key, '')} className="hover:text-destructive transition-colors">
+                  <X className="w-3 h-3" />
+                </button>
+              </span>
+            ))}
+
+            {(hasFilters || filterLibrary) && (
+              <button onClick={clearFilters} className="text-xs text-muted-foreground hover:text-foreground transition-colors ml-1">
+                <Trans>Clear all</Trans>
+              </button>
+            )}
+
+            <div className="flex-1" />
+            <span className="text-xs text-muted-foreground hidden sm:block">
+              {loading
+                ? '…'
+                : (() => {
+                    // Grouped rows are series stacks + standalones — "titles", not the
+                    // ambiguous "entries" (which read like a book count and never matched it).
+                    const shown = books.length
+                    if (totalCount !== null && totalCount > shown) {
+                      return groupActive
+                        ? plural(totalCount, { one: `${shown} of # title`, other: `${shown} of # titles` })
+                        : plural(totalCount, { one: `${shown} of # book`, other: `${shown} of # books` })
+                    }
+                    return groupActive
+                      ? plural(shown, { one: '# title', other: '# titles' })
+                      : plural(shown, { one: '# book', other: '# books' })
+                  })()}
+            </span>
+
+            {/* Group by series toggle */}
+            <button
+              onClick={() => persistGroup(!groupBySeries)}
+              title={groupBySeries ? t`Show individual volumes` : t`Group volumes by series`}
+              aria-label={t`Group by series`}
+              aria-pressed={groupBySeries}
+              className={cn(
+                'flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-all',
+                groupBySeries
+                  ? 'border-primary/40 bg-primary/10 text-primary'
+                  : 'border-border bg-card text-muted-foreground hover:text-foreground hover:bg-muted'
+              )}
+            >
+              <Layers className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline"><Trans>Group series</Trans></span>
+            </button>
+
+            {/* Select mode toggle — selection operates on individual books, hidden while grouped */}
+            {books.length > 0 && !groupActive && (
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => {
+                    if (!selectionMode) {
+                      setSelectionMode(true)
+                      selectAll()
+                    } else if (selected.size > 0) {
+                      clearSelection()
+                    } else {
+                      selectAll()
+                    }
+                  }}
+                  className={cn(
+                    'flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-all',
+                    selectionMode
+                      ? 'border-primary/40 bg-primary/10 text-primary'
+                      : 'border-border bg-card text-muted-foreground hover:text-foreground hover:bg-muted'
+                  )}
+                >
+                  {selectionMode
+                    ? selected.size > 0
+                      ? <><XSquare className="w-3.5 h-3.5" /><span className="hidden sm:inline"> <Trans>Deselect all</Trans></span></>
+                      : <><CheckSquare className="w-3.5 h-3.5" /><span className="hidden sm:inline"> <Trans>Select all</Trans></span></>
+                    : <><CheckSquare className="w-3.5 h-3.5" /><span className="hidden sm:inline"> <Trans>Select</Trans></span></>
+                  }
+                </button>
+                {selectionMode && (
+                  <button
+                    onClick={exitSelectionMode}
+                    title={t`Exit selection mode`}
+                    aria-label={t`Exit selection mode`}
+                    className="p-1.5 rounded-lg border border-border bg-card text-muted-foreground hover:text-foreground hover:bg-muted transition-all"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+            )}
+
+            <div className="flex items-center gap-0.5 bg-muted rounded-lg p-0.5">
+              <input
+                type="range"
+                min={GRID_SIZE_MIN}
+                max={GRID_SIZE_MAX}
+                step={10}
+                value={gridSize}
+                onChange={e => persistGridSize(Number(e.target.value))}
+                title={t`Cover size`}
+                aria-label={t`Cover size`}
+                tabIndex={view === 'grid' ? 0 : -1}
+                className={cn(
+                  'cover-slider transition-all duration-200',
+                  view === 'grid'
+                    ? 'w-20 sm:w-24 opacity-100 mx-2'
+                    : 'w-0 opacity-0 mx-0 pointer-events-none'
+                )}
+                style={{
+                  background: `linear-gradient(to right, var(--primary) ${((gridSize - GRID_SIZE_MIN) / (GRID_SIZE_MAX - GRID_SIZE_MIN)) * 100}%, var(--input) 0)`,
+                }}
+              />
+              {([
+                { mode: 'grid' as ViewPref, Icon: LayoutGrid, title: t`Grid view` },
+                { mode: 'list' as ViewPref, Icon: List, title: t`List view` },
+              ]).map(({ mode, Icon, title }) => (
+                <button key={mode} onClick={() => persistView(mode)} title={title} aria-label={title}
+                  className={cn('p-1.5 rounded-md transition-all',
+                    view === mode ? 'bg-primary/10 text-primary shadow-sm' : 'text-muted-foreground hover:text-foreground')}>
+                  <Icon className="w-3.5 h-3.5" />
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* ── Filter panel ──────────────────────────────────────────────── */}
+          {filterOpen && (
+            <div className="mb-4 p-4 rounded-xl border border-border bg-card flex flex-col gap-4">
+              <div className="flex items-center justify-between sm:hidden">
+                <span className="text-xs font-medium text-muted-foreground"><Trans>Filters</Trans></span>
+                <button
+                  onClick={() => setFilterOpen(false)}
+                  className="p-1 text-muted-foreground hover:text-foreground"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                <FilterSelect label={t`Series`} value={filterSeries} options={facets.series} onChange={v => setFilter('series', v)} />
+                <FilterSelect label={t`Author`} value={filterAuthor} options={facets.authors} onChange={v => setFilter('author', v)} />
+                <FilterSelect label={t`Tag`} value={filterTag} options={facets.tags} onChange={v => setFilter('tag', v)} />
+                <FilterSelect label={t`Format`} value={filterFormat} options={facets.formats.map(f => f.toUpperCase())} onChange={v => setFilter('format', v.toLowerCase())} />
+                {facets.languages.length > 1 && (
+                  <FilterSelect label={t`Language`} value={filterLanguage} options={facets.languages.map(l => ({ value: l.code, label: l.label }))} onChange={v => setFilter('language', v)} />
+                )}
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs text-muted-foreground font-medium w-14"><Trans>Status</Trans></span>
+                {(['', 'unread', 'want_to_read', 'reading', 'read', 'shelved'] as const).map(s => (
+                  <button
+                    key={s}
+                    onClick={() => setFilter('reading_status', s)}
+                    className={cn(
+                      'px-3 py-1 rounded-lg text-xs font-medium border transition-all',
+                      filterReadingStatus === s
+                        ? 'bg-primary text-primary-foreground border-primary'
+                        : 'border-border bg-card text-muted-foreground hover:text-foreground'
+                    )}
+                  >
+                    {s === '' ? t`All` : i18n._(READING_STATUS_LABELS[s])}
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs text-muted-foreground font-medium w-14"><Trans>Rating</Trans></span>
+                {([
+                  { value: '', label: t`All`, starless: true },
+                  { value: '1', label: t`Rated`, starless: true },
+                  { value: '3', label: '3+', starless: false },
+                  { value: '4', label: '4+', starless: false },
+                  { value: '5', label: '5', starless: false },
+                ]).map(({ value, label, starless }) => (
+                  <button
+                    key={value}
+                    onClick={() => setFilter('min_rating', value)}
+                    className={cn(
+                      'px-3 py-1 rounded-lg text-xs font-medium border transition-all inline-flex items-center gap-1',
+                      (filterMinRating ? String(filterMinRating) : '') === value
+                        ? 'bg-primary text-primary-foreground border-primary'
+                        : 'border-border bg-card text-muted-foreground hover:text-foreground'
+                    )}
+                  >
+                    {!starless && <Star className="w-3 h-3 fill-current" />}
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs text-muted-foreground font-medium w-14"><Trans>Missing</Trans></span>
+                {([
+                  { value: '', label: t`None` },
+                  { value: 'cover', label: t`Cover` },
+                  { value: 'description', label: t`Description` },
+                  { value: 'author', label: t`Author` },
+                  { value: 'series', label: t`Series` },
+                  { value: 'any', label: t`Any` },
+                ]).map(({ value, label }) => (
+                  <button
+                    key={value}
+                    onClick={() => setFilter('missing', value)}
+                    className={cn(
+                      'px-3 py-1 rounded-lg text-xs font-medium border transition-all',
+                      filterMissing === value
+                        ? 'bg-primary text-primary-foreground border-primary'
+                        : 'border-border bg-card text-muted-foreground hover:text-foreground'
+                    )}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {/* Ownership filter — members only (not admin) */}
+              {isMember(user) && !isAdmin(user) && (
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-xs text-muted-foreground font-medium w-14"><Trans>Books</Trans></span>
+                  {([
+                    { value: '', label: t`All` },
+                    { value: 'mine', label: t`My Books` },
+                    { value: 'shared', label: t`Shared Library` },
+                  ] as const).map(({ value, label }) => (
+                    <button
+                      key={value}
+                      onClick={() => setFilter('ownership', value)}
+                      className={cn(
+                        'px-3 py-1 rounded-lg text-xs font-medium border transition-all',
+                        filterOwnership === value
+                          ? 'bg-primary text-primary-foreground border-primary'
+                          : 'border-border bg-card text-muted-foreground hover:text-foreground'
+                      )}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {/* Uploader filter — admins only */}
+              {isAdmin(user) && userList.length > 0 && (
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-xs text-muted-foreground font-medium w-14"><Trans>Uploader</Trans></span>
+                  <select
+                    value={filterAddedBy ?? ''}
+                    onChange={e => setFilter('added_by', e.target.value)}
+                    className="text-xs rounded-lg border border-border bg-background px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-ring"
+                  >
+                    <option value="">{t`All users`}</option>
+                    {userList.map(u => (
+                      <option key={u.id} value={u.id}>{u.username} ({u.role})</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs text-muted-foreground font-medium w-14"><Trans>Type</Trans></span>
+                <select
+                  value={contentType}
+                  onChange={e => setContentType(e.target.value)}
+                  className="text-xs rounded-lg border border-border bg-background px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-ring"
+                >
+                  <option value="volume">{t`Volumes`}</option>
+                  <option value="chapter">{t`Chapters`}</option>
+                  <option value="">{t`All`}</option>
+                </select>
+              </div>
+            </div>
+          )}
+
+          {/* ── Bulk action bar ──────────────────────────────────────────── */}
+          {selectionMode && (
+            <div className="mb-3 flex items-center gap-2 px-3 py-2 rounded-xl bg-primary/5 border border-primary/20">
+              <span className="text-xs font-medium text-primary">{(() => { const n = selected.size; return t`${n} selected` })()}</span>
+              <div className="flex-1" />
+              <button
+                onClick={bulkDownload}
+                disabled={bulkPending || selected.size === 0}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-border bg-card text-foreground hover:bg-muted disabled:opacity-50 transition-all"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <Trans>Download ZIP</Trans>
+              </button>
+              {isMember(user) && (
+                <SendButton
+                  variant="bulk"
+                  disabled={bulkPending || selected.size === 0}
+                  books={books.filter(b => selected.has(b.id)).map(b => ({ id: b.id, title: b.title, files: b.files }))}
+                />
+              )}
+              <button
+                onClick={() => { setBulkMetaOpen(true); api.get<Facets>('/books/facets').then(setFacets).catch(() => {}) }}
+                disabled={bulkPending || selected.size === 0}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-border bg-card text-foreground hover:bg-muted disabled:opacity-50 transition-all"
+              >
+                <Pencil className="w-3.5 h-3.5" />
+                <Trans>Edit Metadata</Trans>
+              </button>
+              {libraries.some(l => l.can_edit) && (
+                <div className="relative">
+                  <button
+                    onClick={() => setBulkLibMenu(o => !o)}
+                    disabled={bulkPending || selected.size === 0}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50 transition-all"
+                  >
+                    <LibraryIcon className="w-3.5 h-3.5" />
+                    <Trans>Add to Library</Trans>
+                  </button>
+                  {bulkLibMenu && (
+                    <>
+                      <div className="fixed inset-0 z-10" onClick={() => setBulkLibMenu(false)} />
+                      <div className="absolute right-0 top-full mt-1 z-20 bg-card border border-border rounded-xl shadow-xl py-1 min-w-44">
+                        {libraries.filter(l => l.can_edit).map(lib => (
+                          <button
+                            key={lib.id}
+                            onClick={() => bulkAddToLibrary(lib.id)}
+                            className="flex items-center gap-2 w-full px-3 py-2 text-sm hover:bg-muted transition-colors"
+                          >
+                            <LibraryIcon className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+                            {lib.name}
+                          </button>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+              <button
+                onClick={() => setDeleteModalOpen(true)}
+                disabled={bulkPending || selected.size === 0}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-destructive/30 bg-destructive/10 text-destructive hover:bg-destructive/20 disabled:opacity-50 transition-all"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <Trans>Delete</Trans>
+              </button>
+              <button onClick={exitSelectionMode} className="text-xs text-muted-foreground hover:text-foreground transition-colors">
+                <Trans>Done</Trans>
+              </button>
+            </div>
+          )}
+
+          {/* ── Search result count ───────────────────────────────────────── */}
+          {search && !loading && totalCount !== null && (
+            <p className="text-sm text-muted-foreground mb-3">
+              {totalCount === 0
+                ? t`No results for "${search}"`
+                : plural(totalCount, { one: `# result for "${search}"`, other: `# results for "${search}"` })}
+            </p>
+          )}
+
+          {/* ── Grid / list ───────────────────────────────────────────────── */}
+          {loading ? (
+            <div className="flex justify-center py-24">
+              <BookAnimation variant="refresh" className="block w-12 h-12 text-primary" />
+            </div>
+          ) : books.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-24 gap-4 text-center">
+              <div className="w-16 h-16 rounded-2xl bg-primary/10 flex items-center justify-center">
+                <BookOpen className="w-8 h-8 text-primary/40" />
+              </div>
+              {search ? (
+                <>
+                  <div>
+                    <p className="text-base font-medium text-foreground"><Trans>No results found</Trans></p>
+                    <p className="text-sm text-muted-foreground mt-1"><Trans>Nothing matched &ldquo;{search}&rdquo;</Trans></p>
+                  </div>
+                  <button
+                    onClick={() => { setSearchInput(''); setFilter('q', '') }}
+                    className="text-sm text-primary hover:underline"
+                  >
+                    <Trans>Clear search</Trans>
+                  </button>
+                </>
+              ) : (hasFilters || filterLibrary) ? (
+                <>
+                  <div>
+                    <p className="text-base font-medium text-foreground"><Trans>No matches</Trans></p>
+                    <p className="text-sm text-muted-foreground mt-1"><Trans>Try adjusting your filters</Trans></p>
+                  </div>
+                  <button onClick={clearFilters} className="text-sm text-primary hover:underline"><Trans>Clear all filters</Trans></button>
+                </>
+              ) : (
+                <div>
+                  <p className="text-base font-medium text-foreground"><Trans>Your library is empty</Trans></p>
+                  <p className="text-sm text-muted-foreground mt-1"><Trans>Upload or scan a folder to get started</Trans></p>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div key={view} ref={booksGridRef} className={cn(gridClass, refreshing && 'opacity-50 transition-opacity duration-150')} style={gridStyle}>
+              {/* POC: Motion layout animations replace the hand-rolled FLIP above —
+                  `layout` covers reflows (grid-size slider, filter survivors gliding)
+                  and AnimatePresence adds enter/exit, which FLIP never had. */}
+              <AnimatePresence mode="popLayout" initial={false}>
+              {books.map((book, i) => (
+                <m.div
+                  key={`${cardView}-${groupActive && book.series ? 'stack-' : ''}${book.id}`}
+                  layout
+                  initial={{ opacity: 0, scale: 0.92 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.92 }}
+                  transition={{ layout: { duration: 0.24, ease: [0.2, 0.8, 0.2, 1] }, duration: 0.15 }}
+                >
+                {groupActive && book.series ? (
+                  <SeriesStackCard
+                    book={book}
+                    count={book.series_count ?? 1}
+                    view={cardView}
+                    index={i}
+                    focused={focusedIndex === i}
+                    onOpen={() => navigate(`/?tab=series&series_detail=${encodeURIComponent(book.series!)}`)}
+                  />
+                ) : (
+                <BookCard
+                  book={book}
+                  view={cardView}
+                  index={i}
+                  selected={selected.has(book.id)}
+                  focused={focusedIndex === i}
+                  onSelect={selectionMode ? (e) => { e.preventDefault(); toggleSelect(book.id, e.shiftKey) } : undefined}
+                  onTagClick={tag => setFilter('tag', tag)}
+                  onSeriesClick={series => setFilter('series', series)}
+                  onAuthorClick={author => setFilter('author', author)}
+                  readingStatus={readingStatuses[book.id]?.status}
+                  progressPct={readingStatuses[book.id]?.progress_pct}
+                  rating={readingStatuses[book.id]?.rating}
+                />
+                )}
+                </m.div>
+              ))}
+              </AnimatePresence>
+            </div>
+          )}
+          {/* Infinite scroll sentinel */}
+          <div ref={sentinelCallback} className="h-1 mt-2" />
+          {loadingMore && (
+            <div className="flex justify-center py-4">
+              <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+            </div>
+          )}
+          {!hasMore && booksRef.current.length >= PAGE_SIZE && (() => {
+            const loadedCount = booksRef.current.length
+            return (
+              <p className="text-center text-xs text-muted-foreground py-4">
+                <Trans>All {loadedCount} books loaded</Trans>
+              </p>
+            )
+          })()}
+          </>
+          )}
+        </main>
+      </div>
+
+      {/* ── Bulk delete modal ───────────────────────────────────────────────── */}
+      <BulkDeleteModal
+        open={deleteModalOpen}
+        books={books}
+        selectedIds={selected}
+        onCancel={() => setDeleteModalOpen(false)}
+        onConfirm={bulkDelete}
+      />
+
+      {/* ── Bulk metadata modal ─────────────────────────────────────────────── */}
+      <ModalShell open={bulkMetaOpen} onClose={() => { if (!bulkMetaSaving) setBulkMetaOpen(false) }} className="w-full max-w-md">
+            <div className="bg-card border border-border rounded-2xl shadow-2xl p-6">
+              <div className="flex items-start justify-between mb-1">
+                <h2 className="text-base font-semibold text-foreground">
+                  <Plural value={selected.size} one="Edit Metadata for # Book" other="Edit Metadata for # Books" />
+                </h2>
+                <button
+                  onClick={() => setBulkMetaOpen(false)}
+                  disabled={bulkMetaSaving}
+                  className="text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <p className="text-xs text-muted-foreground mb-4">
+                <Trans>Only filled fields will be updated. Leave blank to keep existing values.</Trans>
+              </p>
+
+              <div className="space-y-3">
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground mb-1 block"><Trans>Author</Trans></label>
+                  <AutocompleteInput
+                    value={bulkMetaAuthor}
+                    onChange={setBulkMetaAuthor}
+                    suggestions={facets.authors}
+                    placeholder={t`Author`}
+                    className="w-full text-sm bg-muted rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-ring"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground mb-1 block"><Trans>Series</Trans></label>
+                  <AutocompleteInput
+                    value={bulkMetaSeries}
+                    onChange={setBulkMetaSeries}
+                    suggestions={facets.series}
+                    placeholder={t`Series name`}
+                    className="w-full text-sm bg-muted rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-ring"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground mb-1 block"><Trans>Add Tags</Trans></label>
+                  <div className="flex flex-wrap gap-1.5 mb-2">
+                    {bulkMetaTagsAdd.map(tag => (
+                      <span key={tag} className="flex items-center gap-1 px-2 py-0.5 rounded-full text-xs bg-muted border border-border text-foreground">
+                        {tag}
+                        <button
+                          type="button"
+                          onClick={() => setBulkMetaTagsAdd(prev => prev.filter(t => t !== tag))}
+                          className="text-muted-foreground hover:text-destructive transition-colors"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                  <AutocompleteInput
+                    value={bulkMetaTagInput}
+                    onChange={setBulkMetaTagInput}
+                    suggestions={facets.tags.filter(t => !bulkMetaTagsAdd.includes(t))}
+                    placeholder={t`Add tag…`}
+                    onSelect={tag => {
+                      if (tag && !bulkMetaTagsAdd.includes(tag)) {
+                        setBulkMetaTagsAdd(prev => [...prev, tag])
+                        setBulkMetaTagInput('')
+                      }
+                    }}
+                    onEnter={val => {
+                      const trimmed = val.trim()
+                      if (trimmed && !bulkMetaTagsAdd.includes(trimmed)) {
+                        setBulkMetaTagsAdd(prev => [...prev, trimmed])
+                        setBulkMetaTagInput('')
+                      }
+                    }}
+                    className="text-sm bg-muted rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-ring w-48"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground mb-1 block"><Trans>Type</Trans></label>
+                  <select
+                    value={bulkMetaTypeId}
+                    onChange={e => setBulkMetaTypeId(e.target.value ? Number(e.target.value) : '')}
+                    className="w-full text-sm bg-muted rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-ring text-foreground"
+                  >
+                    <option value="">{t`— keep existing —`}</option>
+                    {bookTypes.map(t => (
+                      <option key={t.id} value={t.id}>{t.label}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-2 mt-5">
+                <button
+                  onClick={() => setBulkMetaOpen(false)}
+                  disabled={bulkMetaSaving}
+                  className="px-3 py-1.5 rounded-lg text-sm border border-border text-muted-foreground hover:bg-muted transition-colors"
+                >
+                  <Trans>Cancel</Trans>
+                </button>
+                <button
+                  onClick={bulkSaveMetadata}
+                  disabled={bulkMetaSaving || (!bulkMetaAuthor && !bulkMetaSeries && !bulkMetaTagsAdd.length && !bulkMetaTypeId)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50 transition-all"
+                >
+                  {bulkMetaSaving && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  <Trans>Save Changes</Trans>
+                </button>
+              </div>
+            </div>
+      </ModalShell>
+    </div>
+  )
+}
+
+function FilterSelect({ label, value, options, onChange }: {
+  label: string; value: string; options: (string | { value: string; label: string })[]; onChange: (v: string) => void
+}) {
+  const { t } = useLingui()
+  const opts = options.map(o => typeof o === 'string' ? { value: o, label: o } : o)
+  return (
+    <div className="flex flex-col gap-1">
+      <label className="text-xs font-medium text-muted-foreground">{label}</label>
+      <select value={value} onChange={e => onChange(e.target.value)}
+        className="h-8 rounded-md border border-border bg-background px-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring text-foreground">
+        <option value="">{t`All`}</option>
+        {opts.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+      </select>
+    </div>
+  )
+}

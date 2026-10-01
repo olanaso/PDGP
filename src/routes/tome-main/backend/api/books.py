@@ -1,0 +1,3058 @@
+import csv
+import difflib
+import io
+import os
+import re
+import json
+import logging
+import shutil
+from pathlib import Path
+from typing import Optional
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, UploadFile, File, Form, status
+from backend.services.safe_fetch import fetch_safe_image, UnsafeURLError
+from backend.services.ko_hash import ko_partial_md5, record_ko_hash, record_served_artifact
+from fastapi.responses import FileResponse, StreamingResponse
+from sqlalchemy.orm import Session
+
+from backend.core.config import settings
+from backend.core.database import get_db
+from backend.core.security import get_current_user
+from backend.core.permissions import require_role, user_can_see_book
+from backend.models.book import Book, BookFile, BookTag
+from backend.models.user_book_status import UserBookStatus
+from backend.services.audit import audit
+from backend.models.library import Library
+from backend.models.user import User
+from pydantic import BaseModel as PydanticBaseModel
+from backend.schemas.book import (
+    ApplyMetadataRequest, BookDetailOut, BookOut, BookUpdate,
+    MetadataCandidateOut, ScanResultOut,
+)
+from backend.services.scanner import import_incoming, scan_library
+from backend.services.metadata import extract_metadata, get_format, sha256_file
+from backend.services.metadata_fetch import fetch_candidates
+from backend.services.organizer import get_library_path, resolve_unique_path
+
+router = APIRouter(prefix="/books", tags=["books"])
+logger = logging.getLogger(__name__)
+
+ALLOWED_FORMATS = {"epub", "pdf", "cbz", "cbr", "mobi"}
+
+
+# ── Import incoming ───────────────────────────────────────────────────────────
+
+class ScanOptions(PydanticBaseModel):
+    default_type_id: int | None = None
+
+@router.post("/import", response_model=ScanResultOut)
+def trigger_import(
+    opts: ScanOptions = ScanOptions(),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Import new files from incoming/ into the library."""
+    require_role(current_user, "member")
+
+    result = import_incoming(
+        incoming_dir=settings.incoming_dir,
+        library_dir=settings.library_dir,
+        covers_dir=settings.covers_dir,
+        db=db,
+        added_by=current_user.id,
+    )
+    _apply_default_type(db, result.added_ids, opts.default_type_id)
+    return result
+
+
+@router.post("/scan", response_model=ScanResultOut)
+def trigger_scan(
+    opts: ScanOptions = ScanOptions(),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Scan library/ for files not yet in the DB (e.g. manually added)."""
+    require_role(current_user, "member")
+
+    result = scan_library(
+        library_dir=settings.library_dir,
+        covers_dir=settings.covers_dir,
+        db=db,
+        added_by=current_user.id,
+    )
+    _apply_default_type(db, result.added_ids, opts.default_type_id)
+    return result
+
+
+def _apply_default_type(db: Session, book_ids: list[int], type_id: int | None) -> None:
+    if not type_id or not book_ids:
+        return
+    from backend.models.library import BookType
+    from backend.services.book_types import assign_book_to_type_library
+    bt = db.get(BookType, type_id)
+    if not bt:
+        return
+    books = db.query(Book).filter(Book.id.in_(book_ids)).all()
+    for book in books:
+        book.book_type_id = type_id
+        assign_book_to_type_library(db, book, bt)
+
+
+# ── List ──────────────────────────────────────────────────────────────────────
+
+SORT_FIELDS = {
+    "title": Book.title,
+    "author": Book.author,
+    "year": Book.year,
+    "added_at": Book.added_at,
+}
+
+def _filtered_books_query(
+    db: Session,
+    current_user: User,
+    *,
+    q: Optional[str] = None,
+    series: Optional[str] = None,
+    no_series: Optional[bool] = None,
+    author: Optional[str] = None,
+    tag: Optional[str] = None,
+    format: Optional[str] = None,
+    language: Optional[str] = None,
+    library_id: Optional[int] = None,
+    reading_status: Optional[str] = None,
+    min_rating: Optional[int] = None,
+    missing: Optional[str] = None,
+    content_type: Optional[str] = None,
+    added_by: Optional[int] = None,
+    ownership: Optional[str] = None,
+    with_rating_join: bool = False,
+):
+    """Build the filtered books query shared by the list and ids endpoints.
+
+    Returns (query, join_effective_rating, eff_rating). eff_rating is None
+    unless min_rating or with_rating_join forced the rating outer-joins;
+    join_effective_rating lets the caller re-apply those joins after a
+    group-by rebuild (which drops them).
+    """
+    from backend.core.permissions import is_admin as _is_admin
+
+    query = db.query(Book).filter(Book.status == "active")
+
+    # ── Role-based visibility ────────────────────────────────────────────────
+    # Single source of truth lives in backend.core.permissions; see there for
+    # the full rule (library membership gates everything; unfiled admin/legacy
+    # books stay shared; admins see all).
+    if not _is_admin(current_user):
+        from backend.core.permissions import book_visibility_filter
+        query = query.filter(book_visibility_filter(db, current_user))
+
+    if q:
+        from sqlalchemy import text as sa_text
+        # Split into individual prefix-matched terms (AND semantics is FTS5 default)
+        terms = q.split()
+        fts_term = " ".join(f'"{t.replace(chr(34), "")}"*' for t in terms if t)
+        fts_rows = db.execute(
+            sa_text("SELECT rowid FROM books_fts WHERE books_fts MATCH :q ORDER BY rank"),
+            {"q": fts_term},
+        ).fetchall()
+        fts_ids = [row[0] for row in fts_rows]
+        if fts_ids:
+            query = query.filter(Book.id.in_(fts_ids))
+        else:
+            query = query.filter(Book.id == -1)
+    if series:
+        query = query.filter(Book.series == series)
+    if no_series:
+        query = query.filter(Book.series.is_(None))
+    if author:
+        query = query.filter(Book.author == author)
+    if tag:
+        query = query.join(Book.tags).filter(BookTag.tag == tag)
+    if format:
+        query = query.join(Book.files).filter(BookFile.format == format.lower())
+    if language:
+        # The param is a canonical code; stored values are messy. Resolve which
+        # raw variants fold to it and match those (small distinct cardinality).
+        from backend.services.languages import normalize_language
+        target = normalize_language(language)
+        raw_matches = [
+            r[0] for r in db.query(Book.language).filter(
+                Book.language.isnot(None), Book.language != ""
+            ).distinct().all()
+            if normalize_language(r[0]) == target
+        ]
+        query = query.filter(Book.language.in_(raw_matches) if raw_matches else Book.id == -1)
+    if library_id:
+        query = query.join(Book.libraries).filter(Library.id == library_id)
+    if reading_status in ("reading", "read", "shelved", "want_to_read"):
+        query = query.join(
+            UserBookStatus,
+            (UserBookStatus.book_id == Book.id) & (UserBookStatus.user_id == current_user.id)
+        ).filter(UserBookStatus.status == reading_status)
+    elif reading_status == "unread":
+        # Unread = no status row, or status explicitly "unread"
+        from sqlalchemy import or_, not_, exists
+        subq = exists().where(
+            (UserBookStatus.book_id == Book.id) &
+            (UserBookStatus.user_id == current_user.id) &
+            (UserBookStatus.status != "unread")
+        )
+        query = query.filter(~subq)
+
+    # ── Rating filter / sort prep ────────────────────────────────────────────
+    # Effective rating = the user's own volume rating, else the inherited series
+    # rating (COALESCE). Two aliased outer-joins (current user only) carry both
+    # without colliding with the reading_status join above. join_effective_rating
+    # is re-applied after the group_by rebuild (which drops joins) so grouped sort
+    # works too. min_rating is applied before group_by so it flows into id_sq.
+    from sqlalchemy.orm import aliased as _aliased
+    from sqlalchemy import func as _rfunc
+    from backend.models.user_series_rating import UserSeriesRating
+
+    def _join_effective_rating(inner):
+        ubs = _aliased(UserBookStatus)
+        usr = _aliased(UserSeriesRating)
+        inner = inner.outerjoin(ubs, (ubs.book_id == Book.id) & (ubs.user_id == current_user.id))
+        inner = inner.outerjoin(usr, (usr.series_name == Book.series) & (usr.user_id == current_user.id))
+        return inner, _rfunc.coalesce(ubs.rating, usr.rating)
+
+    eff_rating = None
+    if min_rating is not None or with_rating_join:
+        query, eff_rating = _join_effective_rating(query)
+        if min_rating is not None:
+            query = query.filter(eff_rating >= min_rating)
+
+    if missing:
+        from sqlalchemy import or_ as sa_or_
+        no_cover = Book.cover_path.is_(None)
+        no_description = sa_or_(Book.description.is_(None), Book.description == "")
+        no_author = sa_or_(Book.author.is_(None), Book.author == "")
+        no_series_f = sa_or_(Book.series.is_(None), Book.series == "")
+        if missing == "cover":
+            query = query.filter(no_cover)
+        elif missing == "description":
+            query = query.filter(no_description)
+        elif missing == "author":
+            query = query.filter(no_author)
+        elif missing == "series":
+            query = query.filter(no_series_f)
+        elif missing == "any":
+            query = query.filter(sa_or_(no_cover, no_description, no_author, no_series_f))
+
+    if content_type:
+        query = query.filter(Book.content_type == content_type)
+
+    # ── Ownership / uploader filters ─────────────────────────────────────────
+    if added_by is not None and _is_admin(current_user):
+        query = query.filter(Book.added_by == added_by)
+    if ownership == "mine":
+        query = query.filter(Book.added_by == current_user.id)
+    elif ownership == "shared":
+        from sqlalchemy import or_ as _or_
+        shared_admin_ids = [
+            u.id for u in db.query(User).filter(
+                (User.is_admin == True) | (User.role == "admin")
+            ).all()
+        ]
+        query = query.filter(
+            _or_(
+                Book.added_by.in_(shared_admin_ids),
+                Book.added_by.is_(None),
+            )
+        )
+
+    return query, _join_effective_rating, eff_rating
+
+
+@router.get("/ids")
+def list_book_ids(
+    q: Optional[str] = Query(None),
+    series: Optional[str] = Query(None),
+    no_series: Optional[bool] = Query(None),
+    author: Optional[str] = Query(None),
+    tag: Optional[str] = Query(None),
+    format: Optional[str] = Query(None),
+    language: Optional[str] = Query(None),
+    library_id: Optional[int] = Query(None),
+    reading_status: Optional[str] = Query(None),
+    min_rating: Optional[int] = Query(None, ge=1, le=5),
+    missing: Optional[str] = Query(None),
+    content_type: Optional[str] = Query(None),
+    added_by: Optional[int] = Query(None),
+    ownership: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """IDs of every book matching the given filters.
+
+    Powers dashboard select-all so it covers the whole filtered set, not just
+    the pages the infinite scroll has loaded. Same filters and visibility
+    rules as the list endpoint.
+    """
+    query, _jr, _er = _filtered_books_query(
+        db, current_user,
+        q=q, series=series, no_series=no_series, author=author, tag=tag,
+        format=format, language=language, library_id=library_id,
+        reading_status=reading_status, min_rating=min_rating, missing=missing,
+        content_type=content_type, added_by=added_by, ownership=ownership,
+    )
+    ids = [row[0] for row in query.with_entities(Book.id).distinct().all()]
+    return {"ids": ids}
+
+
+@router.get("", response_model=list[BookOut])
+def list_books(
+    response: Response,
+    q: Optional[str] = Query(None, description="Full-text search across title/author/series/tags"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(200, ge=1, le=500),
+    sort: str = Query("title", pattern="^(title|author|year|added_at|status_updated|rating)$"),
+    order: str = Query("asc", pattern="^(asc|desc)$"),
+    min_rating: Optional[int] = Query(None, ge=1, le=5, description="Filter to books the current user rated at least this many stars"),
+    series: Optional[str] = Query(None, description="Exact series name filter"),
+    no_series: Optional[bool] = Query(None, description="Filter to books with no series"),
+    author: Optional[str] = Query(None, description="Exact author filter"),
+    tag: Optional[str] = Query(None, description="Tag name filter"),
+    format: Optional[str] = Query(None, description="File format filter (epub, pdf, …)"),
+    language: Optional[str] = Query(None, description="Language filter — canonical code (en, de, …); matches messy stored variants"),
+    library_id: Optional[int] = Query(None, description="Filter to books in this library"),
+    reading_status: Optional[str] = Query(None, description="Filter by reading status: unread, reading, read"),
+    missing: Optional[str] = Query(None, description="Filter books missing a field: cover, description, author, series, any"),
+    content_type: Optional[str] = Query(None, description="Filter by content type: volume, chapter"),
+    added_by: Optional[int] = Query(None, description="Filter by uploader user ID (admin only)"),
+    ownership: Optional[str] = Query(None, description="Ownership filter: 'mine' or 'shared' (member only)"),
+    group_by_series: Optional[bool] = Query(None, description="Collapse series into one representative book each, annotated with series_count"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    query, _join_effective_rating, eff_rating = _filtered_books_query(
+        db, current_user,
+        q=q, series=series, no_series=no_series, author=author, tag=tag,
+        format=format, language=language, library_id=library_id,
+        reading_status=reading_status, min_rating=min_rating, missing=missing,
+        content_type=content_type, added_by=added_by, ownership=ownership,
+        with_rating_join=(sort == "rating"),
+    )
+
+    # ── Group by series ──────────────────────────────────────────────────────
+    # Collapse each series to one representative volume (lowest series_index)
+    # annotated with how many volumes matched the active filters; standalone
+    # books pass through with a count of 1.
+    if group_by_series:
+        from sqlalchemy import func as _func, select as _select
+
+        # Joins above (tags, files, libraries) can duplicate book rows —
+        # collapse to distinct IDs first so the window count isn't inflated.
+        id_sq = query.with_entities(Book.id).distinct().subquery()
+        partition = _func.coalesce(Book.series, _func.printf("__solo__%d", Book.id))
+        win_sq = (
+            db.query(
+                Book.id.label("book_id"),
+                partition.label("grp"),
+                _func.row_number()
+                .over(
+                    partition_by=partition,
+                    order_by=(Book.series_index.asc().nullslast(), Book.title.asc()),
+                )
+                .label("rn"),
+                _func.count().over(partition_by=partition).label("series_count"),
+            )
+            .filter(Book.id.in_(_select(id_sq.c.id)))
+            .subquery()
+        )
+        query = (
+            db.query(Book, win_sq.c.series_count)
+            .join(win_sq, Book.id == win_sq.c.book_id)
+            .filter(win_sq.c.rn == 1)
+        )
+        if sort == "status_updated":
+            # status_updated needs the UserBookStatus join the grouped query
+            # rebuild doesn't carry — fall back to a sane default.
+            sort = "added_at"
+        elif sort == "rating":
+            # The rebuild dropped the rating joins; re-attach them to the new
+            # query so stacks sort by their representative volume's effective
+            # rating (which inherits the series rating). min_rating already
+            # flowed into id_sq above.
+            query, eff_rating = _join_effective_rating(query)
+
+    # When filtering by a specific series, always sort by series_index
+    if series:
+        query = query.order_by(Book.series_index.asc().nullslast(), Book.title.asc())
+    elif sort == "rating":
+        # Highest-rated first by default; unrated books sort last either way.
+        rating_sort = eff_rating.desc() if order == "desc" else eff_rating.asc()
+        query = query.order_by(rating_sort.nullslast(), Book.title.asc())
+    elif sort == "status_updated" and reading_status:
+        # Sort by when the reading status was last updated (needs UserBookStatus join)
+        if reading_status not in ("reading", "read"):
+            # Fallback — status_updated only meaningful with a status filter
+            query = query.order_by(Book.added_at.desc(), Book.title.asc())
+        else:
+            # UserBookStatus already joined above for reading_status filter
+            status_sort = UserBookStatus.updated_at.desc() if order == "desc" else UserBookStatus.updated_at.asc()
+            query = query.order_by(status_sort, Book.title.asc())
+    else:
+        sort_col = SORT_FIELDS.get(sort, Book.title)
+        sort_expr = sort_col.asc() if order == "asc" else sort_col.desc()
+        # Always secondary-sort by title so results are stable
+        if sort != "title":
+            query = query.order_by(sort_expr, Book.title.asc())
+        else:
+            # Natural sort for titles: group series together (primary = series or own
+            # title), then by series_index so Vol. 2 precedes Vol. 10 instead of
+            # lexical "Vol. 10" < "Vol. 2".
+            from sqlalchemy import func as _func
+            primary = _func.coalesce(Book.series, Book.title)
+            if order == "asc":
+                query = query.order_by(
+                    primary.asc(),
+                    Book.series_index.asc().nullslast(),
+                    Book.title.asc(),
+                )
+            else:
+                query = query.order_by(
+                    primary.desc(),
+                    Book.series_index.desc().nullslast(),
+                    Book.title.desc(),
+                )
+
+    total = query.distinct().count()
+    response.headers["X-Total-Count"] = str(total)
+    response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
+    # Eager-load the relationships BookOut serializes (files, tags, libraries
+    # via the library_ids property) so a page is a few queries, not ~3 per row.
+    from sqlalchemy.orm import selectinload
+    rows = (
+        query.options(
+            selectinload(Book.files),
+            selectinload(Book.tags),
+            selectinload(Book.libraries),
+        )
+        .distinct()
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+    if group_by_series:
+        # For the stacked-card fan effect, fetch the next two volumes per
+        # series on this page that actually have a cover (ID-only query).
+        series_names = [b.series for b, _ in rows if b.series]
+        fan_map: dict[str, list[int]] = {}
+        if series_names:
+            fan_rows = (
+                db.query(win_sq.c.grp, win_sq.c.book_id)
+                .join(Book, Book.id == win_sq.c.book_id)
+                .filter(
+                    win_sq.c.grp.in_(series_names),
+                    win_sq.c.rn > 1,
+                    Book.cover_path.isnot(None),
+                )
+                .order_by(win_sq.c.grp, win_sq.c.rn)
+                .all()
+            )
+            for grp, bid in fan_rows:
+                ids = fan_map.setdefault(grp, [])
+                if len(ids) < 2:
+                    ids.append(bid)
+        books = []
+        for book, series_count in rows:
+            book.series_count = int(series_count)
+            book.stack_cover_ids = fan_map.get(book.series or "", [])
+            books.append(book)
+        return books
+    return rows
+
+
+# ── Facets (for filter dropdowns) ────────────────────────────────────────────
+
+@router.get("/facets", response_model=dict)
+def get_facets(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return distinct values for filter dropdowns: series, authors, tags, formats."""
+    from sqlalchemy import func
+    from backend.core.permissions import book_visibility_filter
+    visibility = book_visibility_filter(db, current_user)
+
+    series = [r[0] for r in db.query(Book.series).filter(
+        Book.status == "active", Book.series.isnot(None), visibility
+    ).distinct().order_by(Book.series).all()]
+
+    authors = [r[0] for r in db.query(Book.author).filter(
+        Book.status == "active", Book.author.isnot(None), visibility
+    ).distinct().order_by(Book.author).all()]
+
+    tags = [r[0] for r in db.query(BookTag.tag).join(Book).filter(
+        Book.status == "active", visibility
+    ).distinct().order_by(BookTag.tag).all()]
+
+    formats = [r[0] for r in db.query(BookFile.format).join(Book).filter(
+        Book.status == "active", visibility
+    ).distinct().order_by(BookFile.format).all()]
+
+    # Languages: fold messy stored values (en / eng / en-US / English) to a
+    # canonical code with a human label, deduped, so the dropdown is clean.
+    from backend.services.languages import normalize_language, language_label
+    raw_langs = [r[0] for r in db.query(Book.language).filter(
+        Book.status == "active", Book.language.isnot(None), Book.language != "", visibility
+    ).distinct().all()]
+    lang_codes = {c for c in (normalize_language(l) for l in raw_langs) if c}
+    languages = sorted(
+        ({"code": c, "label": language_label(c)} for c in lang_codes),
+        key=lambda x: x["label"],
+    )
+
+    return {"series": series, "authors": authors, "tags": tags, "formats": formats, "languages": languages}
+
+
+# ── Series list ───────────────────────────────────────────────────────────────
+
+@router.get("/series")
+def get_series(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return all series with book count, cover book id, description snippet, and reading status counts."""
+    from sqlalchemy import func
+    from backend.core.permissions import book_visibility_filter
+    visibility = book_visibility_filter(db, current_user)
+
+    series_rows = (
+        db.query(Book.series, func.count(Book.id).label("book_count"))
+        .filter(Book.status == "active", Book.series.isnot(None), visibility)
+        .group_by(Book.series)
+        .order_by(Book.series)
+        .all()
+    )
+
+    # Fetch all reading statuses for this user in one query — keyed by book_id
+    all_statuses: dict[int, str] = {}
+    status_rows = (
+        db.query(UserBookStatus.book_id, UserBookStatus.status)
+        .filter(UserBookStatus.user_id == current_user.id)
+        .all()
+    )
+    for book_id, st in status_rows:
+        all_statuses[book_id] = st
+
+    # Per-user volume ratings (book_id → rating) + explicit series ratings, for
+    # the series display rating: explicit if set, else the volume average.
+    from backend.models.user_series_rating import UserSeriesRating
+    all_ratings: dict[int, int] = {
+        bid: r for bid, r in db.query(UserBookStatus.book_id, UserBookStatus.rating)
+        .filter(UserBookStatus.user_id == current_user.id, UserBookStatus.rating.isnot(None)).all()
+    }
+    series_ratings: dict[str, int] = {
+        sr.series_name: sr.rating for sr in db.query(UserSeriesRating)
+        .filter(UserSeriesRating.user_id == current_user.id, UserSeriesRating.rating.isnot(None)).all()
+    }
+
+    result = []
+    for series_name, book_count in series_rows:
+        # Pick the book with the lowest series_index as the cover; fall back to lowest id if all null
+        series_books = (
+            db.query(Book)
+            .filter(Book.status == "active", Book.series == series_name, visibility)
+            .order_by(
+                Book.series_index.is_(None),  # nulls last
+                Book.series_index,
+                Book.id,
+            )
+            .all()
+        )
+        first_book = series_books[0] if series_books else None
+        # Cover comes from the first volume that actually has one — returning a
+        # coverless book's id made every grid render request its cover and 404.
+        cover_book = next((b for b in series_books if b.cover_path), None)
+
+        read_count = sum(1 for b in series_books if all_statuses.get(b.id) == "read")
+        reading_count = sum(1 for b in series_books if all_statuses.get(b.id) == "reading")
+
+        vol_ratings = [all_ratings[b.id] for b in series_books if b.id in all_ratings]
+        explicit = series_ratings.get(series_name)
+        # Derived average rounds to the nearest HALF star — ratings are
+        # half-step values now, and the star widgets can render halves.
+        display_rating = (
+            explicit if explicit is not None
+            else (round(sum(vol_ratings) / len(vol_ratings) * 2) / 2 if vol_ratings else None)
+        )
+
+        result.append({
+            "name": series_name,
+            "book_count": book_count,
+            "cover_book_id": cover_book.id if cover_book else None,
+            "description": first_book.description if first_book else None,
+            "author": first_book.author if first_book else None,
+            "read_count": read_count,
+            "reading_count": reading_count,
+            "rating": display_rating,
+        })
+
+    # Append unserialized bucket if any books have no series
+    unserialized_count = (
+        db.query(func.count(Book.id))
+        .filter(Book.status == "active", Book.series.is_(None), visibility)
+        .scalar()
+    )
+    if unserialized_count:
+        first_unserialized = (
+            db.query(Book)
+            .filter(
+                Book.status == "active", Book.series.is_(None),
+                Book.cover_path.isnot(None), visibility,
+            )
+            .order_by(Book.id)
+            .first()
+        )
+        result.append({
+            "name": "__unserialized__",
+            "book_count": unserialized_count,
+            "cover_book_id": first_unserialized.id if first_unserialized else None,
+            "description": None,
+            "author": None,
+            "read_count": 0,
+            "reading_count": 0,
+            "rating": None,
+        })
+
+    return result
+
+
+# ── Series detail ─────────────────────────────────────────────────────────────
+
+@router.get("/series-detail")
+def get_series_detail(
+    name: str = Query(..., description="Series name"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return all books in a series with per-user reading status, ordered by series_index."""
+    from backend.core.permissions import book_visibility_filter
+    books = (
+        db.query(Book)
+        .filter(Book.status == "active", Book.series == name, book_visibility_filter(db, current_user))
+        .order_by(Book.series_index.asc().nullslast(), Book.title.asc())
+        .all()
+    )
+
+    # Fetch reading statuses for all books in one query
+    book_ids = [b.id for b in books]
+    statuses: dict[int, UserBookStatus] = {}
+    if book_ids:
+        rows = (
+            db.query(UserBookStatus)
+            .filter(
+                UserBookStatus.user_id == current_user.id,
+                UserBookStatus.book_id.in_(book_ids),
+            )
+            .all()
+        )
+        statuses = {r.book_id: r for r in rows}
+
+    # Build author and description from first book
+    first = books[0] if books else None
+    author = first.author if first else None
+    description = first.description if first else None
+
+    book_list = []
+    for b in books:
+        st = statuses.get(b.id)
+        book_list.append({
+            "id": b.id,
+            "title": b.title,
+            "series_index": b.series_index,
+            "cover_path": b.cover_path,
+            "reading_status": st.status if st else "unread",
+            "progress_pct": st.progress_pct if st else None,
+        })
+
+    # Backlog estimate over the volumes not started yet (#187).
+    from backend.services import backlog_estimate as be
+    unstarted = [b for b in books if (statuses.get(b.id).status if statuses.get(b.id) else "unread") not in ("read", "reading")]
+    backlog = be.summarise(db, unstarted, be.compute_pace(db, current_user.id)) if unstarted else None
+
+    return {
+        "name": name,
+        "author": author,
+        "description": description,
+        "books": book_list,
+        "backlog": backlog,
+    }
+
+
+@router.get("/export")
+def export_books(
+    format: str = Query("json", pattern="^(json|csv)$"),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    books = db.query(Book).filter(Book.status == "active").all()
+    rows = []
+    for b in books:
+        rows.append({
+            "id": b.id,
+            "title": b.title,
+            "author": b.author or "",
+            "series": b.series or "",
+            "series_index": b.series_index,
+            "year": b.year,
+            "language": b.language or "",
+            "publisher": b.publisher or "",
+            "isbn": b.isbn or "",
+            "tags": ", ".join(t.tag for t in b.tags),
+            "formats": ", ".join(f.format for f in b.files),
+            "added_at": b.added_at.isoformat(),
+        })
+
+    if format == "csv":
+        output = io.StringIO()
+        if rows:
+            writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="tome-books.csv"'},
+        )
+    else:
+        return StreamingResponse(
+            iter([json.dumps(rows, indent=2)]),
+            media_type="application/json",
+            headers={"Content-Disposition": 'attachment; filename="tome-books.json"'},
+        )
+
+
+# ── Standardize titles ───────────────────────────────────────────────────────
+
+import re as _re
+
+_VOLUME_PATTERN = _re.compile(
+    r'[\s,]*'
+    r'(?:[-\u2013]\s*)?'
+    r'(?:'
+    r'\(?[Vv]ol(?:ume)?\.?\s*(\d+(?:\.\d+)?)\)?'
+    r'|[Vv](\d+(?:\.\d+)?)'
+    r'|#(\d+(?:\.\d+)?)'
+    r')'
+    r'\s*$'
+)
+
+_SUBTITLE_SEP = _re.compile(r'\s*[-\u2013:]\s+')
+
+
+def _standardize_book_title(book: Book) -> dict:
+    title = book.title or ""
+    series = book.series or ""
+    series_index = book.series_index
+
+    proposed_title = title
+    proposed_subtitle: str | None = book.subtitle
+    proposed_series: str | None = series or None
+    proposed_series_index: float | None = series_index
+
+    if series:
+        # Case 1: book has series — title should be the series name
+        vol_match = _VOLUME_PATTERN.search(title)
+
+        # Only strip volume suffix (and trailing noise) when a volume pattern was found
+        if vol_match:
+            stripped = _VOLUME_PATTERN.sub("", title).strip().rstrip(",-: ")
+            # Extract volume number if not already set
+            if series_index is None:
+                raw = next(g for g in vol_match.groups() if g is not None)
+                try:
+                    proposed_series_index = float(raw) if "." in raw else int(raw)
+                except ValueError:
+                    pass
+        else:
+            stripped = title
+
+        # Compare stripped title to series name (case-insensitive prefix)
+        series_lower = series.strip().lower()
+        stripped_lower = stripped.lower()
+
+        if stripped_lower == series_lower:
+            # Title is exactly the series name — nothing left for subtitle
+            proposed_title = series
+            proposed_subtitle = None
+        elif stripped_lower.startswith(series_lower):
+            # Extra text after the series name → subtitle
+            extra = stripped[len(series):].strip()
+            # Strip any leading separator characters (dash, colon, comma, space)
+            extra = _re.sub(r'^[-\u2013:,\s]+', '', extra).strip()
+            proposed_title = series
+            proposed_subtitle = extra if extra else None
+        elif vol_match:
+            # Volume was stripped but title doesn't start with series name — just use stripped title
+            proposed_title = stripped if stripped else title
+        # else: no volume match, title doesn't resemble series — no change
+
+    else:
+        # Case 2: no series, but title contains a volume pattern
+        vol_match = _VOLUME_PATTERN.search(title)
+        if vol_match:
+            raw = next(g for g in vol_match.groups() if g is not None)
+            stripped = _VOLUME_PATTERN.sub("", title).strip().rstrip(",-: ")
+            try:
+                proposed_series_index = float(raw) if "." in raw else int(raw)
+            except ValueError:
+                pass
+            proposed_title = stripped
+            proposed_series = stripped  # series name = cleaned title
+
+    changed = (
+        proposed_title != (book.title or "")
+        or proposed_subtitle != book.subtitle
+        or proposed_series != (book.series or None)
+        or proposed_series_index != book.series_index
+    )
+
+    return {
+        "book_id": book.id,
+        "current_title": book.title or "",
+        "current_subtitle": book.subtitle,
+        "current_series": book.series,
+        "current_series_index": book.series_index,
+        "proposed_title": proposed_title,
+        "proposed_subtitle": proposed_subtitle,
+        "proposed_series": proposed_series,
+        "proposed_series_index": proposed_series_index,
+        "changed": changed,
+    }
+
+
+class _StandardizeRequest(PydanticBaseModel):
+    book_ids: list[int]
+
+
+@router.post("/standardize-titles")
+def standardize_titles(
+    body: _StandardizeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Preview title standardization proposals. Does NOT apply changes."""
+    require_role(current_user, "admin")
+
+    books = db.query(Book).filter(Book.id.in_(body.book_ids)).all()
+    return [_standardize_book_title(b) for b in books]
+
+
+# ── Library health ───────────────────────────────────────────────────────────
+
+class ReorganizeRequest(PydanticBaseModel):
+    file_ids: list[int]
+    dry_run: bool = False
+
+
+# OS metadata droppings that are safe to delete when emptying a folder.
+# Anything else — .stfolder/.stversions (Syncthing), .git, unknown dotfiles —
+# means the folder is not junk and must be left alone.
+_JUNK_FILENAMES = {".ds_store", "thumbs.db", "desktop.ini"}
+
+
+def _is_junk_file(p: Path) -> bool:
+    return p.is_file() and (
+        p.name.lower() in _JUNK_FILENAMES or p.name.startswith("._")
+    )
+
+
+@router.post("/purge-empty-dirs")
+def purge_empty_dirs(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Walk library_dir bottom-up and remove dirs that contain only OS junk files. Admin only."""
+    require_role(current_user, "admin")
+
+    removed: list[str] = []
+    # Walk bottom-up so child dirs are processed before parents
+    for dirpath, dirnames, filenames in os.walk(settings.library_dir, topdown=False):
+        current = Path(dirpath)
+        if current == settings.library_dir:
+            continue
+        try:
+            entries = list(current.iterdir())
+            if not all(_is_junk_file(e) for e in entries):
+                continue  # real content, a subdir, or an unrecognised dotfile — keep
+            for e in entries:
+                e.unlink(missing_ok=True)
+            current.rmdir()
+            removed.append(str(current.relative_to(settings.library_dir)))
+        except OSError:
+            continue  # changed underneath us or not deletable — skip, never fail the purge
+
+    if removed:
+        audit(db, "purge_empty_dirs",
+              user_id=current_user.id,
+              username=current_user.username,
+              details={"removed": len(removed)})
+
+    return {"removed": removed}
+
+
+def _cleanup_empty_dirs(start: Path, stop_at: Path, removed: list[str]) -> None:
+    """Remove dirs containing nothing but OS junk, from start up to (but not including) stop_at."""
+    current = start
+    while current != stop_at and current.is_relative_to(stop_at):
+        try:
+            if not current.is_dir():
+                break
+            entries = list(current.iterdir())
+            if not all(_is_junk_file(e) for e in entries):
+                break
+            for e in entries:
+                e.unlink(missing_ok=True)
+            rel = str(current.relative_to(stop_at))
+            current.rmdir()
+            removed.append(rel)
+            current = current.parent
+        except OSError:
+            break  # cleanup is best-effort; the moves already succeeded
+
+
+@router.get("/library-health")
+def library_health(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Compare actual file locations against organizer rules. Admin only."""
+    require_role(current_user, "admin")
+
+    from sqlalchemy.orm import joinedload as _jl
+    books = (
+        db.query(Book)
+        .options(_jl(Book.files))
+        .filter(Book.status == "active")
+        .all()
+    )
+
+    issues = []
+    missing = []
+    for book in books:
+        meta = {
+            "title": book.title,
+            "author": book.author,
+            "series": book.series,
+            "series_index": book.series_index,
+            "year": book.year,
+        }
+        for bf in book.files:
+            actual_path = Path(bf.file_path)
+
+            # A file that is gone from disk is an orphaned entry, not a
+            # misplaced one — report it separately and skip the layout check.
+            if not actual_path.exists():
+                missing.append({
+                    "book_id": book.id,
+                    "file_id": bf.id,
+                    "title": book.title or "",
+                    "author": book.author or "",
+                    "series": book.series or "",
+                    "format": bf.format,
+                    "path": str(actual_path.relative_to(settings.library_dir)) if actual_path.is_relative_to(settings.library_dir) else str(actual_path),
+                    "book_file_count": len(book.files),
+                })
+                continue
+
+            expected_rel = get_library_path(meta, actual_path.name)
+            expected_abs = settings.library_dir / expected_rel
+
+            if actual_path.resolve() != expected_abs.resolve():
+                issues.append({
+                    "book_id": book.id,
+                    "file_id": bf.id,
+                    "title": book.title or "",
+                    "author": book.author or "",
+                    "series": book.series or "",
+                    "series_index": book.series_index,
+                    "format": bf.format,
+                    "current_path": str(actual_path.relative_to(settings.library_dir)) if actual_path.is_relative_to(settings.library_dir) else str(actual_path),
+                    "expected_path": str(expected_rel),
+                })
+
+    total_files = sum(len(b.files) for b in books)
+    return {
+        "total_files": total_files,
+        "misplaced_count": len(issues),
+        "issues": issues,
+        "missing_count": len(missing),
+        "missing": missing,
+    }
+
+
+class RemoveMissingRequest(PydanticBaseModel):
+    file_ids: list[int]
+
+
+@router.post("/remove-missing")
+def remove_missing_files(
+    req: RemoveMissingRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Remove BookFile entries whose file no longer exists on disk. Admin only.
+
+    A book left with no files at all is deleted entirely (metadata, statuses,
+    cover). Entries whose file still exists are refused — this endpoint never
+    touches anything that is actually on disk.
+    """
+    require_role(current_user, "admin")
+
+    if not req.file_ids:
+        raise HTTPException(status_code=400, detail="file_ids must not be empty")
+
+    skipped: list[dict] = []
+    by_book: dict[int, list[BookFile]] = {}
+    files = db.query(BookFile).filter(BookFile.id.in_(req.file_ids)).all()
+    for bf in files:
+        if Path(bf.file_path).exists():
+            skipped.append({"file_id": bf.id, "error": "file exists on disk"})
+            continue
+        by_book.setdefault(bf.book_id, []).append(bf)
+
+    removed_file_rows = 0
+    removed_books: list[dict] = []
+    for book_id, dead in by_book.items():
+        book = db.get(Book, book_id)
+        if book is None:
+            continue
+        dead_ids = {bf.id for bf in dead}
+        if all(f.id in dead_ids for f in book.files):
+            # Every file of this book is a dead entry — remove the whole book.
+            # The disk unlink inside is a no-op (the files are already gone).
+            title = book.title
+            _delete_book_record(book, db, current_user)
+            removed_books.append({"book_id": book_id, "title": title})
+        else:
+            for bf in dead:
+                db.delete(bf)
+            db.commit()
+            removed_file_rows += len(dead)
+
+    if removed_file_rows or removed_books:
+        audit(db, "books.missing_removed",
+              user_id=current_user.id,
+              username=current_user.username,
+              details={"file_rows": removed_file_rows, "books_removed": len(removed_books)})
+
+    return {
+        "removed_file_rows": removed_file_rows,
+        "removed_books": removed_books,
+        "skipped": skipped,
+    }
+
+
+@router.post("/reorganize")
+def reorganize_files(
+    req: ReorganizeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Move book files to match current metadata. Admin only."""
+    require_role(current_user, "admin")
+
+    files = db.query(BookFile).filter(BookFile.id.in_(req.file_ids)).all()
+    book_ids = {bf.book_id for bf in files}
+    books = {b.id: b for b in db.query(Book).filter(Book.id.in_(book_ids)).all()}
+
+    moved: list[dict] = []
+    errors: list[dict] = []
+    affected_dirs: set[Path] = set()
+
+    for bf in files:
+        book = books[bf.book_id]
+        meta = {
+            "title": book.title,
+            "author": book.author,
+            "series": book.series,
+            "series_index": book.series_index,
+            "year": book.year,
+        }
+        actual = Path(bf.file_path)
+        expected_rel = get_library_path(meta, actual.name)
+        expected_abs = settings.library_dir / expected_rel
+
+        if actual.resolve() == expected_abs.resolve():
+            continue  # already correct
+
+        from_rel = str(actual.relative_to(settings.library_dir)) if actual.is_relative_to(settings.library_dir) else str(actual)
+        to_rel = str(expected_rel)
+
+        # Canonical slot held by a different file: report a conflict instead of
+        # suffixing — a "Title (2).epub" fails the next health check and would
+        # ratchet to (3), (4)… on every subsequent reorganize.
+        if expected_abs.exists() and not (
+            actual.exists() and os.path.samefile(actual, expected_abs)
+        ):
+            errors.append({"file_id": bf.id, "error": f"target already occupied by another file: {to_rel}"})
+            continue
+
+        if req.dry_run:
+            moved.append({"file_id": bf.id, "from": from_rel, "to": to_rel})
+            continue
+
+        try:
+            expected_abs.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(actual), str(expected_abs))
+            affected_dirs.add(actual.parent)
+            bf.file_path = str(expected_abs)
+            # Commit per file: a crash mid-batch must never leave moved files
+            # pointing at DB rows that still hold the old path.
+            db.commit()
+            moved.append({"file_id": bf.id, "from": from_rel, "to": to_rel})
+        except Exception as e:
+            db.rollback()
+            errors.append({"file_id": bf.id, "error": str(e)})
+
+    folders_removed: list[str] = []
+    if not req.dry_run:
+        for d in affected_dirs:
+            _cleanup_empty_dirs(d, settings.library_dir, folders_removed)
+        if moved:
+            audit(db, "reorganize_files",
+                  user_id=current_user.id,
+                  username=current_user.username,
+                  details={"moved": len(moved), "folders_removed": len(folders_removed)})
+
+    return {"moved": moved, "errors": errors, "folders_removed": folders_removed}
+
+
+# ── Metadata audit ───────────────────────────────────────────────────────────
+
+@router.get("/metadata-audit")
+def metadata_audit(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Returns all books with completeness scores for the admin metadata manager."""
+    require_role(current_user, "admin")
+
+    from sqlalchemy.orm import joinedload as _jl
+    books = (
+        db.query(Book)
+        .options(_jl(Book.book_type), _jl(Book.libraries), _jl(Book.files))
+        .filter(Book.status == "active")
+        .filter(Book.content_type != "chapter")
+        .all()
+    )
+
+    results = []
+    for book in books:
+        fields = {
+            "title": bool(book.title),
+            "author": bool(book.author),
+            "series": bool(book.series),
+            "year": bool(book.year),
+            "description": bool(book.description),
+            "cover": bool(book.cover_path),
+            "isbn": bool(book.isbn),
+            "language": bool(book.language),
+            "publisher": bool(book.publisher),
+        }
+        results.append({
+            "id": book.id,
+            "title": book.title or "",
+            "author": book.author or "",
+            "series": book.series or "",
+            "series_index": book.series_index,
+            "year": book.year,
+            "subtitle": book.subtitle or "",
+            "description_snippet": (book.description or "")[:120],
+            "isbn": book.isbn or "",
+            "language": book.language or "",
+            "publisher": book.publisher or "",
+            "cover_path": book.cover_path,
+            "book_type_label": book.book_type.label if book.book_type else None,
+            "book_type_id": book.book_type_id,
+            "content_type": book.content_type,
+            "library_ids": [lib.id for lib in book.libraries],
+            "fields_present": fields,
+            "completeness": sum(fields.values()),
+            "completeness_total": len(fields),
+        })
+
+    return results
+
+
+# ── Adjacent book navigation ──────────────────────────────────────────────────
+
+@router.get("/{book_id}/adjacent")
+def get_adjacent_books(
+    book_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from backend.core.permissions import book_visibility_filter
+    book = db.get(Book, book_id)
+    if not book or not user_can_see_book(db, current_user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    # Peers must respect the same visibility rules — don't leak titles/covers of
+    # sibling books the user can't otherwise see (e.g. private-library volumes).
+    visibility = book_visibility_filter(db, current_user)
+
+    def to_stub(b: Book | None) -> dict | None:
+        if b is None:
+            return None
+        return {"id": b.id, "title": b.title, "series_index": b.series_index, "cover_path": b.cover_path}
+
+    if book.series:
+        peers = (
+            db.query(Book)
+            .filter(Book.series == book.series, Book.status == "active", visibility)
+            .order_by(Book.series_index.asc().nullslast(), Book.title.asc())
+            .all()
+        )
+        mode = "series"
+    elif book.author:
+        peers = (
+            db.query(Book)
+            .filter(Book.author == book.author, Book.status == "active", visibility)
+            .order_by(Book.title.asc())
+            .all()
+        )
+        mode = "author"
+    else:
+        return {"prev": None, "next": None, "mode": None}
+
+    ids = [b.id for b in peers]
+    try:
+        pos = ids.index(book_id)
+    except ValueError:
+        return {"prev": None, "next": None, "mode": None}
+
+    prev_book = peers[pos - 1] if pos > 0 else None
+    next_book = peers[pos + 1] if pos < len(peers) - 1 else None
+
+    return {"prev": to_stub(prev_book), "next": to_stub(next_book), "mode": mode}
+
+
+@router.get("/{book_id}/annotations")
+def get_book_annotations(
+    book_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Highlights/notes the current user has synced from KOReader for this book.
+
+    KOReader owns annotations and pushes them via the TomeSync plugin; the web's
+    only write is DELETE /api/annotations/{id} (drops the row + tombstones it so the
+    deletion syncs back). Web reader (foliate) inline rendering is a later phase.
+    """
+    from backend.models.tome_sync import Annotation
+
+    book = db.get(Book, book_id)
+    if not book or book.status != "active":
+        raise HTTPException(status_code=404, detail="Book not found")
+    if not user_can_see_book(db, current_user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    rows = (
+        db.query(Annotation)
+        .filter(Annotation.user_id == current_user.id, Annotation.book_id == book_id)
+        .order_by(Annotation.koreader_datetime, Annotation.id)
+        .all()
+    )
+    return [
+        {
+            "id": a.id,
+            "anchor": a.anchor,
+            "cfi": a.cfi,   # set for web-created highlights — paints without a text search
+            "highlighted_text": a.highlighted_text,
+            "note": a.note,
+            "chapter": a.chapter,
+            "color": a.color,
+            "datetime": a.koreader_datetime,
+            "updated_at": a.updated_at.isoformat() + "Z",
+        }
+        for a in rows
+    ]
+
+
+# ── Reader pacing ("time left in chapter") ────────────────────────────────────
+
+@router.get("/{book_id}/reader-pacing")
+def get_reader_pacing(
+    book_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Everything the web reader needs for "time left in chapter": the book's
+    chapter map (fraction-of-book boundaries), its word count, and the user's
+    true WPM. The WPM mirrors the stats rule exactly — finished word-counted
+    books with >= 5 min of reconciled read-time — and is null until the user
+    has such history (the reader falls back to a default pace)."""
+    from backend.models.book import BookChapter
+    from backend.services import reconciled_reading as rr
+    from backend.services.reading_day import DayCtx
+
+    book = _visible_book_or_404(db, current_user, book_id)
+    chapters = (
+        db.query(BookChapter)
+        .filter(BookChapter.book_id == book_id)
+        .order_by(BookChapter.idx)
+        .all()
+    )
+
+    wpm = None
+    covered = rr.covered_book_ids(db, current_user.id)
+    secs_by_book = rr.book_seconds(db, current_user.id, DayCtx(0), covered, None, None)
+    rows = (
+        db.query(Book.id, Book.word_count)
+        .join(UserBookStatus, UserBookStatus.book_id == Book.id)
+        .filter(
+            UserBookStatus.user_id == current_user.id,
+            UserBookStatus.status == "read",
+            Book.status == "active",
+            Book.word_count.isnot(None),
+        )
+        .all()
+    )
+    WPM_MIN_SECONDS = 300
+    words = secs = 0
+    for bid, wc in rows:
+        s = int(secs_by_book.get(bid, (0, 0, 0))[0])
+        if s >= WPM_MIN_SECONDS:
+            words += int(wc)
+            secs += s
+    if secs > 0:
+        wpm = round(words * 60 / secs, 1)
+
+    return {
+        "word_count": book.word_count,
+        "wpm": wpm,
+        "chapters": [
+            {"title": c.title, "start_fraction": c.start_fraction, "end_fraction": c.end_fraction}
+            for c in chapters
+        ],
+    }
+
+
+@router.get("/{book_id}/estimate")
+def get_book_estimate(
+    book_id: int,
+    tz_offset: int = Query(0, description="Client timezone offset in minutes (JS getTimezoneOffset)"),
+    tz: Optional[str] = Query(None, description="IANA timezone name for DST-correct day bucketing"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """How long this whole book would take at the user's pace (#187) — for
+    books not started yet. In-progress books get "remaining" from the
+    reading-stats block instead; this is the full-length figure."""
+    from backend.services import backlog_estimate as be
+
+    book = _visible_book_or_404(db, current_user, book_id)
+    pace = be.compute_pace(db, current_user.id, tz_offset, tz)
+    return be.estimate_book(book, pace)
+
+
+# ── Position history (restore a bad sync) ─────────────────────────────────────
+
+def _visible_book_or_404(db: Session, current_user: User, book_id: int) -> Book:
+    book = db.get(Book, book_id)
+    if not book or book.status != "active" or not user_can_see_book(db, current_user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
+    return book
+
+
+@router.get("/{book_id}/position-history")
+def get_position_history(
+    book_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """The user's recent position log for this book, newest first, plus the
+    live position — the recovery UI for a bad sync (a device jumping a book
+    to 100% is otherwise unrecoverable)."""
+    from backend.models.tome_sync import PositionHistory, TomeSyncPosition
+
+    _visible_book_or_404(db, current_user, book_id)
+    current = (
+        db.query(TomeSyncPosition)
+        .filter(TomeSyncPosition.user_id == current_user.id,
+                TomeSyncPosition.book_id == book_id)
+        .first()
+    )
+    rows = (
+        db.query(PositionHistory)
+        .filter(PositionHistory.user_id == current_user.id,
+                PositionHistory.book_id == book_id)
+        .order_by(PositionHistory.id.desc())
+        .all()
+    )
+    return {
+        "current": {
+            "percentage": current.percentage,
+            "device": current.device,
+            "updated_at": current.updated_at.isoformat() + "Z",
+        } if current else None,
+        "history": [
+            {
+                "id": r.id,
+                "percentage": r.percentage,
+                "device": r.device,
+                "created_at": r.created_at.isoformat() + "Z",
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.post("/{book_id}/position-history/{history_id}/restore")
+def restore_position(
+    book_id: int,
+    history_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Set the live position back to a logged entry. Devices pick it up on
+    their next pull (per their pull-conflict strategy); the restore itself is
+    logged too, so it can be undone the same way.
+
+    Unlike normal progress writes, a restore is an explicit override of the
+    sticky-completion rule: recovering from a device that falsely jumped a
+    book to 100% must also un-finish it, or the position comes back but the
+    book stays "read"."""
+    from datetime import datetime
+    from backend.models.tome_sync import PositionHistory
+    from backend.models.user_book_status import UserBookStatus
+    from backend.services.book_progress import upsert_position
+
+    _visible_book_or_404(db, current_user, book_id)
+    entry = db.get(PositionHistory, history_id)
+    if not entry or entry.user_id != current_user.id or entry.book_id != book_id:
+        raise HTTPException(status_code=404, detail="History entry not found")
+
+    upsert_position(
+        db, user_id=current_user.id, book_id=book_id,
+        percentage=entry.percentage, progress=entry.progress, device="restore",
+    )
+    status_row = (
+        db.query(UserBookStatus)
+        .filter(UserBookStatus.user_id == current_user.id,
+                UserBookStatus.book_id == book_id)
+        .first()
+    )
+    if status_row is None:
+        status_row = UserBookStatus(user_id=current_user.id, book_id=book_id)
+        db.add(status_row)
+    status_row.progress_pct = entry.percentage
+    status_row.cfi = entry.progress
+    if entry.percentage >= 0.99:
+        status_row.status = "read"
+        if status_row.finished_at is None:
+            status_row.finished_at = datetime.utcnow()
+    else:
+        if status_row.status == "read":
+            status_row.finished_at = None
+        if entry.percentage > 0:
+            status_row.status = "reading"
+        elif status_row.status != "want_to_read":
+            # A zero-position restore resets to unread — but a queued book
+            # stays queued (it never had a position to lose).
+            status_row.status = "unread"
+    db.commit()
+    audit(db, "books.position_restored", user_id=current_user.id, username=current_user.username,
+          resource_type="book", resource_id=book_id,
+          details={"percentage": entry.percentage, "history_id": history_id})
+    return {"ok": True, "percentage": entry.percentage, "status": status_row.status}
+
+
+# ── Per-book reading stats ────────────────────────────────────────────────────
+
+@router.get("/{book_id}/reading-stats")
+def get_book_reading_stats(
+    book_id: int,
+    tz_offset: int = Query(0, description="Client timezone offset in minutes (JS getTimezoneOffset)"),
+    tz: Optional[str] = Query(None, description="IANA timezone name for DST-correct day bucketing"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return the current user's reading statistics for one book.
+
+    Admins additionally receive a library-wide aggregate (all users).
+    """
+    from backend.core.permissions import is_admin as _is_admin
+    from backend.services.reading_stats import (
+        compute_book_reading_stats,
+        compute_book_aggregate_stats,
+        compute_book_chapter_times,
+        compute_book_page_intensity,
+    )
+
+    book = db.get(Book, book_id)
+    if not book or book.status != "active":
+        raise HTTPException(status_code=404, detail="Book not found")
+    if not user_can_see_book(db, current_user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    own = compute_book_reading_stats(db, user_id=current_user.id, book_id=book_id, tz_offset=tz_offset, tz_name=tz)
+    aggregate = (
+        compute_book_aggregate_stats(db, book_id=book_id)
+        if _is_admin(current_user)
+        else None
+    )
+    # Per-page intensity from imported KOReader page-stats (None if web-only reading)
+    intensity = compute_book_page_intensity(db, user_id=current_user.id, book_id=book_id, tz_offset=tz_offset, tz_name=tz)
+    # Time per TOC chapter (None without a chapter map or page-stats)
+    chapters = compute_book_chapter_times(db, user_id=current_user.id, book_id=book_id)
+
+    return {"own": own, "aggregate": aggregate, "intensity": intensity, "chapters": chapters}
+
+
+class ManualSessionIn(PydanticBaseModel):
+    duration_minutes: float
+    end_progress: Optional[float] = None   # 0–1 fraction reached at the end of the session
+    pages: Optional[int] = None
+    started_at: Optional[str] = None       # ISO; defaults to now (UTC)
+
+
+@router.post("/{book_id}/sessions", status_code=201)
+def add_manual_reading_session(
+    book_id: int,
+    payload: ManualSessionIn,
+    tz_offset: int = Query(0, description="Client timezone offset in minutes (JS getTimezoneOffset)"),
+    tz: Optional[str] = Query(None, description="IANA timezone name for DST-correct day bucketing"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Log a reading session by hand (``device="manual"``).
+
+    Mirrors the device-session status logic (sticky completion) so a manual
+    entry advances progress/status the same way a synced one would. Returns the
+    refreshed per-book ``own`` stats so the UI can update without a second call.
+    """
+    from datetime import datetime, timedelta, timezone as _timezone
+    import uuid as _uuid
+    from backend.models.tome_sync import ReadingSession
+    from backend.models.user_book_status import UserBookStatus
+    from backend.services.book_progress import apply_progress_to_status
+    from backend.services.reading_stats import compute_book_reading_stats
+
+    book = db.get(Book, book_id)
+    if not book or book.status != "active":
+        raise HTTPException(status_code=404, detail="Book not found")
+    if not user_can_see_book(db, current_user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    if payload.duration_minutes is None or payload.duration_minutes <= 0:
+        raise HTTPException(status_code=422, detail="duration_minutes must be positive")
+    if payload.duration_minutes > 24 * 60:
+        # Also guards timedelta overflow (a huge value 500'd instead of 422ing).
+        raise HTTPException(status_code=422, detail="duration_minutes must be at most 1440 (24 hours)")
+    if payload.end_progress is not None and not (0.0 <= payload.end_progress <= 1.0):
+        raise HTTPException(status_code=422, detail="end_progress must be between 0 and 1")
+    if payload.pages is not None and payload.pages < 0:
+        raise HTTPException(status_code=422, detail="pages must be zero or positive")
+
+    duration = round(payload.duration_minutes * 60)
+    if payload.started_at:
+        try:
+            started = datetime.fromisoformat(payload.started_at.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid started_at")
+        if started.tzinfo is not None:
+            # Convert to UTC — everything else in the DB is UTC-naive. Stripping
+            # the offset would store "23:30+02:00" as 23:30 UTC (2h off).
+            started = started.astimezone(_timezone.utc).replace(tzinfo=None)
+    else:
+        started = datetime.utcnow()
+
+    status_row = (
+        db.query(UserBookStatus)
+        .filter(UserBookStatus.user_id == current_user.id, UserBookStatus.book_id == book_id)
+        .first()
+    )
+    prior = (
+        db.query(ReadingSession)
+        .filter(ReadingSession.user_id == current_user.id, ReadingSession.book_id == book_id)
+        .order_by(ReadingSession.started_at.desc())
+        .first()
+    )
+    progress_start = (
+        prior.progress_end if prior and prior.progress_end is not None
+        else (status_row.progress_pct if status_row else None)
+    )
+
+    db.add(ReadingSession(
+        user_id=current_user.id,
+        book_id=book_id,
+        started_at=started,
+        ended_at=started + timedelta(seconds=duration),
+        duration_seconds=duration,
+        progress_start=progress_start,
+        progress_end=payload.end_progress,
+        pages_turned=payload.pages,
+        device="manual",
+        session_uuid=str(_uuid.uuid4()),
+    ))
+
+    # Shared sticky-completion rule: a manual session advances progress/status
+    # the same way a synced one would, and never un-finishes a "read" book.
+    if payload.end_progress is not None:
+        apply_progress_to_status(
+            db, user_id=current_user.id, book_id=book_id,
+            pct=payload.end_progress, status_row=status_row,
+        )
+
+    db.commit()
+    return {"own": compute_book_reading_stats(db, user_id=current_user.id, book_id=book_id, tz_offset=tz_offset, tz_name=tz)}
+
+
+@router.delete("/{book_id}/imported-history")
+def clear_imported_history(
+    book_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete the current user's imported KOReader page-stats for one book.
+
+    The escape hatch for history the statistics import attributed to the wrong
+    book (issue #152) — cases the automatic repair refuses to touch because the
+    book mixes ghost and genuine rows. Scope is deliberately narrow: only
+    imported page-stats (the "Reading intensity" data), never live or manual
+    ReadingSessions, positions, or read-status — those have their own tooling.
+
+    Fuzzy match rows pointing at the book are reset to unmatched so future
+    syncs re-decide them under the volume-guarded matcher instead of re-filing
+    onto the same book. Hash/filename matches are left alone: their identity is
+    deterministic, so future reading of the book re-imports correctly — this
+    clears history, it does not disable tracking.
+    """
+    from backend.models.ko_stats import KoStatsBookMatch, PageStat
+
+    book = db.get(Book, book_id)
+    if not book or book.status != "active":
+        raise HTTPException(status_code=404, detail="Book not found")
+    if not user_can_see_book(db, current_user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    deleted = (
+        db.query(PageStat)
+        .filter(PageStat.user_id == current_user.id, PageStat.book_id == book_id)
+        .delete(synchronize_session=False)
+    )
+    matches_reset = 0
+    fuzzy_matches = (
+        db.query(KoStatsBookMatch)
+        .filter(
+            KoStatsBookMatch.user_id == current_user.id,
+            KoStatsBookMatch.book_id == book_id,
+            KoStatsBookMatch.method == "fuzzy",
+        )
+        .all()
+    )
+    for m in fuzzy_matches:
+        m.book_id = None
+        m.status = "unmatched"
+        m.method = "none"
+        m.confidence = 0.0
+        matches_reset += 1
+
+    db.commit()
+    return {"pages_deleted": deleted, "matches_reset": matches_reset}
+
+
+# ── Single book ───────────────────────────────────────────────────────────────
+
+@router.get("/{book_id}", response_model=BookDetailOut)
+def get_book(
+    book_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    from backend.core.permissions import is_admin as _is_admin, user_can_see_book
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    # Visibility check for non-admins (shared rule, see permissions.py)
+    if not _is_admin(current_user) and not user_can_see_book(db, current_user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
+    return book
+
+
+# ── Bulk fetch metadata ───────────────────────────────────────────────────────
+
+class BulkFetchRequest(PydanticBaseModel):
+    book_ids: list[int]
+
+
+class BulkCandidateResult(PydanticBaseModel):
+    book_id: int
+    book_title: str
+    book_author: Optional[str] = None
+    book_cover_path: Optional[str] = None
+    book_description: Optional[str] = None
+    book_publisher: Optional[str] = None
+    book_year: Optional[int] = None
+    book_series: Optional[str] = None
+    book_series_index: Optional[float] = None
+    book_content_type: Optional[str] = None
+    candidates: list[MetadataCandidateOut]
+    best_match_index: Optional[int] = None  # index into candidates, None = no confident match
+
+
+def _score_candidate(candidate, book: Book) -> int:
+    """Relevance of a candidate for this book — the single scoring brain now
+    lives in backend/services/metadata_rank.py (same weights); this is the
+    Book-model adapter."""
+    from backend.services.metadata_rank import ScoreContext, score_candidate
+    return score_candidate(candidate, ScoreContext(
+        title=book.title, author=book.author, isbn=book.isbn,
+        year=book.year, language=book.language,
+        series=book.series, series_index=book.series_index,
+        media_hint=book.book_type.slug if book.book_type else None,
+    ))
+
+
+@router.post("/bulk-fetch-candidates", response_model=list[BulkCandidateResult])
+async def bulk_fetch_candidates(
+    body: BulkFetchRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Fetch metadata candidates for multiple books for user review. Does not apply anything."""
+    require_role(current_user, "member")
+
+    if len(body.book_ids) > 100:
+        raise HTTPException(status_code=400, detail="Too many books (max 100)")
+
+    books = db.query(Book).filter(Book.id.in_(body.book_ids)).all()
+    # Skip chapters — they don't have meaningful metadata on external sources
+    books = [b for b in books if b.content_type != "chapter"]
+    book_map = {b.id: b for b in books}
+
+    import asyncio as _asyncio
+
+    # Bounded fan-out: 100 unbounded parallel fetches (3+ HTTP calls each) used
+    # to trip the very source rate limits that then read as "no results".
+    sem = _asyncio.Semaphore(4)
+
+    async def fetch_for_book(book: Book):
+        try:
+            async with sem:
+                result = await fetch_candidates(
+                    title=book.title,
+                    author=book.author,
+                    isbn=book.isbn,
+                    series=book.series,
+                    series_index=book.series_index,
+                    year=book.year,
+                    language=book.language,
+                    media_hint=book.book_type.slug if book.book_type else None,
+                )
+            candidates = result.candidates
+        except Exception as e:
+            logger.warning("bulk_fetch_candidates failed for book %d: %s", book.id, e)
+            candidates = []
+
+        best_index = None
+        if candidates:
+            scores = [(_score_candidate(c, book), i) for i, c in enumerate(candidates)]
+            best_score, best_i = max(scores, key=lambda x: (x[0], -x[1]))
+            if best_score >= 4:
+                best_index = best_i
+
+        return BulkCandidateResult(
+            book_id=book.id,
+            book_title=book.title,
+            book_author=book.author,
+            book_cover_path=book.cover_path,
+            book_description=book.description,
+            book_publisher=book.publisher,
+            book_year=book.year,
+            book_series=book.series,
+            book_series_index=book.series_index,
+            candidates=[MetadataCandidateOut.model_validate(c.__dict__) for c in candidates],
+            best_match_index=best_index,
+        )
+
+    results = await _asyncio.gather(*[fetch_for_book(book_map[bid]) for bid in body.book_ids if bid in book_map])
+    return list(results)
+
+
+@router.post("/bulk-fetch-metadata")
+async def bulk_fetch_metadata(
+    body: BulkFetchRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """For each book, fetch the best metadata candidate and fill any empty fields."""
+    require_role(current_user, "member")
+
+    if len(body.book_ids) > 100:
+        raise HTTPException(status_code=400, detail="Too many books (max 100)")
+
+    books = db.query(Book).filter(Book.id.in_(body.book_ids)).all()
+    # Skip chapters — they don't have meaningful metadata on external sources
+    books = [b for b in books if b.content_type != "chapter"]
+    updated = 0
+    no_match = 0
+    errors = 0
+
+    for book in books:
+        try:
+            result = await fetch_candidates(
+                title=book.title,
+                author=book.author,
+                isbn=book.isbn,
+                series=book.series,
+                series_index=book.series_index,
+            )
+            candidates = result.candidates
+            if not candidates:
+                no_match += 1
+                continue
+
+            best = candidates[0]
+            changed = False
+
+            # Only fill fields that are currently empty
+            simple_fields = ("author", "description", "publisher", "year", "language", "isbn", "series", "series_index")
+            for f in simple_fields:
+                if getattr(book, f) is None and getattr(best, f) is not None:
+                    setattr(book, f, getattr(best, f))
+                    changed = True
+
+            # Add tags (never remove existing ones)
+            if best.tags:
+                existing = {t.tag for t in book.tags}
+                for tag in best.tags:
+                    tag = tag.strip()
+                    if tag and tag not in existing:
+                        book.tags.append(BookTag(book_id=book.id, tag=tag, source="metadata_fetch"))
+                        changed = True
+
+            # Download cover only if book has none
+            if best.cover_url and not book.cover_path:
+                try:
+                    cover_data = await fetch_safe_image(best.cover_url)
+                    cover_filename = f"book_{book.id}_fetched.jpg"
+                    cover_path = settings.covers_dir / cover_filename
+                    cover_path.parent.mkdir(parents=True, exist_ok=True)
+                    cover_path.write_bytes(cover_data)
+                    book.cover_path = cover_filename
+                    changed = True
+                except Exception:
+                    pass  # cover fetch failure is non-fatal
+
+            if changed:
+                updated += 1
+            else:
+                no_match += 1  # found a candidate but nothing new to fill
+
+        except Exception as e:
+            logger.warning("Bulk fetch failed for book %d: %s", book.id, e)
+            errors += 1
+
+    db.flush()
+    from backend.services.fts import index_book
+    for b in books:
+        index_book(db, b)
+    db.commit()
+    return {"updated": updated, "no_match": no_match, "errors": errors}
+
+
+# ── Bulk metadata update ──────────────────────────────────────────────────────
+
+class BulkMetadataUpdate(PydanticBaseModel):
+    book_ids: list[int]
+    author: Optional[str] = None
+    series: Optional[str] = None
+    series_index: Optional[float] = None
+    tags: Optional[list[str]] = None       # if set, REPLACE tags on all selected books
+    tags_add: Optional[list[str]] = None   # if set, ADD these tags without removing existing
+    book_type_id: Optional[int] = None
+
+
+@router.put("/bulk-metadata")
+def bulk_update_metadata(
+    body: BulkMetadataUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    require_role(current_user, "member")
+
+    bt = None
+    if body.book_type_id is not None:
+        from backend.models.library import BookType
+        bt = db.get(BookType, body.book_type_id)
+        if not bt:
+            raise HTTPException(status_code=400, detail="Invalid book_type_id")
+
+    books = db.query(Book).filter(Book.id.in_(body.book_ids)).all()
+    for book in books:
+        if body.author is not None:
+            book.author = body.author or None
+        if body.series is not None:
+            book.series = body.series or None
+        if body.series_index is not None:
+            book.series_index = body.series_index
+        if body.tags is not None:
+            book.tags = [BookTag(book_id=book.id, tag=t.strip(), source="user") for t in body.tags if t.strip()]
+        elif body.tags_add:
+            existing = {t.tag for t in book.tags}
+            for t in body.tags_add:
+                if t.strip() and t.strip() not in existing:
+                    book.tags.append(BookTag(book_id=book.id, tag=t.strip(), source="user"))
+        if bt is not None:
+            book.book_type_id = bt.id
+    db.flush()
+    from backend.services.fts import index_book
+    for book in books:
+        index_book(db, book)
+    db.commit()
+
+    if bt is not None:
+        from backend.services.book_types import assign_book_to_type_library
+        for book in books:
+            assign_book_to_type_library(db, book, bt)
+
+    changes = {k: v for k, v in body.model_dump(exclude_unset=True).items() if k != "book_ids"}
+    audit(db, "books.bulk_metadata_edited", user_id=current_user.id, username=current_user.username,
+          details={"book_ids": body.book_ids, "count": len(books), "changes": changes})
+    return {"updated": len(books)}
+
+
+# ── Update metadata ───────────────────────────────────────────────────────────
+
+@router.put("/{book_id}", response_model=BookDetailOut)
+def update_book(
+    book_id: int,
+    body: BookUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    require_role(current_user, "member")
+
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    # Members can only edit their own uploads; admins can edit any book
+    from backend.core.permissions import is_admin as _is_admin
+    if not _is_admin(current_user) and book.added_by != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only edit books you uploaded")
+
+    data = body.model_dump(exclude_unset=True)
+    tags = data.pop("tags", None)
+    new_type_id = data.pop("book_type_id", None)
+    for field_name, value in data.items():
+        setattr(book, field_name, value)
+    if tags is not None:
+        book.tags = [BookTag(book_id=book.id, tag=t.strip(), source="user") for t in tags if t.strip()]
+
+    if new_type_id is not None and new_type_id != book.book_type_id:
+        from backend.models.library import BookType
+        from backend.services.book_types import assign_book_to_type_library
+        bt = db.get(BookType, new_type_id)
+        if not bt:
+            raise HTTPException(status_code=400, detail="Invalid book_type_id")
+        book.book_type_id = new_type_id
+        assign_book_to_type_library(db, book, bt)
+
+    db.flush()
+    from backend.services.fts import index_book
+    index_book(db, book)
+    db.commit()
+    db.refresh(book)
+    audit(db, "books.metadata_edited", user_id=current_user.id, username=current_user.username,
+          resource_type="book", resource_id=book.id, resource_title=book.title,
+          details={k: v for k, v in body.model_dump(exclude_unset=True).items()})
+    return book
+
+
+# ── Cover ─────────────────────────────────────────────────────────────────────
+
+@router.get("/{book_id}/cover")
+def get_cover(
+    book_id: int,
+    db: Session = Depends(get_db),
+):
+    """Serve book cover — no auth required (covers are not sensitive)."""
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if not book or not book.cover_path:
+        raise HTTPException(status_code=404, detail="Cover not found")
+
+    cover_file = settings.covers_dir / book.cover_path
+    if not cover_file.exists():
+        raise HTTPException(status_code=404, detail="Cover file missing")
+
+    return FileResponse(str(cover_file), media_type="image/jpeg")
+
+
+class CoverCandidateOut(PydanticBaseModel):
+    source: str   # "hardcover" | "google_books" | "open_library"
+    label: str
+    cover_url: str
+
+
+@router.get("/{book_id}/cover-candidates", response_model=list[CoverCandidateOut])
+async def get_cover_candidates(
+    book_id: int,
+    q: Optional[str] = Query(None, description="Override search query"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Fetch cover image candidates from Hardcover, Google Books and OpenLibrary in parallel."""
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    import asyncio
+    from backend.services.metadata_fetch import _hardcover, _google_books, _open_library, _build_query
+
+    query_override = q or None
+    effective_isbn = None if query_override else book.isbn
+    query = _build_query(book.title, book.author, effective_isbn,
+                         book.series, book.series_index, query_override)
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        hc_results, gb_results, ol_results = await asyncio.gather(
+            _hardcover(client, book.title, book.author, effective_isbn,
+                       book.series, book.series_index, query_override),
+            _google_books(client, query, effective_isbn),
+            _open_library(client, query, effective_isbn),
+            return_exceptions=True,
+        )
+
+    candidates: list[CoverCandidateOut] = []
+    seen_urls: set[str] = set()
+
+    # Hardcover first — best cover quality
+    source_map = [
+        (hc_results, "hardcover", "Hardcover"),
+        (gb_results, "google_books", "Google Books"),
+        (ol_results, "open_library", "OpenLibrary"),
+    ]
+    for results, source_key, source_label in source_map:
+        if isinstance(results, Exception):
+            logger.warning("Cover candidate fetch failed for %s: %s", source_key, results)
+            continue
+        for c in results:
+            if c.cover_url and c.cover_url not in seen_urls:
+                seen_urls.add(c.cover_url)
+                title_snippet = c.title[:40] if c.title else ""
+                candidates.append(CoverCandidateOut(
+                    source=source_key,
+                    label=f"{source_label} — {title_snippet}",
+                    cover_url=c.cover_url,
+                ))
+
+    return candidates
+
+
+@router.post("/{book_id}/cover", response_model=BookDetailOut)
+async def set_book_cover(
+    book_id: int,
+    url: Optional[str] = Form(default=None),
+    file: Optional[UploadFile] = File(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Replace a book's cover — accepts either a remote URL or a file upload."""
+    require_role(current_user, "member")
+
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    if not url and not file:
+        raise HTTPException(status_code=400, detail="Provide either url or file")
+
+    # Remove old cover file
+    if book.cover_path:
+        old_file = settings.covers_dir / book.cover_path
+        old_file.unlink(missing_ok=True)
+
+    cover_filename = f"book_{book_id}_cover.jpg"
+    cover_path = settings.covers_dir / cover_filename
+    cover_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if url:
+        try:
+            data = await fetch_safe_image(url)
+        except UnsafeURLError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid cover URL: {exc}")
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Cover download failed: {exc}")
+        cover_path.write_bytes(data)
+    else:
+        data = await file.read()
+        cover_path.write_bytes(data)
+
+    book.cover_path = cover_filename
+    db.commit()
+    db.refresh(book)
+    audit(db, "books.cover_changed", user_id=current_user.id, username=current_user.username,
+          resource_type="book", resource_id=book.id, resource_title=book.title,
+          details={"source": "url" if url else "upload"})
+    return book
+
+
+# ── Download ──────────────────────────────────────────────────────────────────
+
+@router.get("/{book_id}/download/{file_id}")
+def download_book(
+    book_id: int,
+    file_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    book_file = (
+        db.query(BookFile)
+        .filter(BookFile.id == file_id, BookFile.book_id == book_id)
+        .first()
+    )
+    if not book_file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    from backend.core.permissions import user_can_see_book
+    if not user_can_see_book(db, current_user, book_file.book):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    from backend.services.download_quota import enforce_download_limit, record_download
+    enforce_download_limit(db, current_user)
+
+    file_path = Path(book_file.file_path)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File no longer on disk")
+
+    from backend.services.metadata_embed import get_baked_path
+    serve_path = get_baked_path(book_file.book, book_file)
+    record_served_artifact(db, book_file.book_id, book_file, serve_path)
+    record_download(db, current_user, book_id)
+
+    filename = f"{book_file.book.title}.{book_file.format}"
+    audit(db, "books.downloaded", user_id=current_user.id, username=current_user.username,
+          resource_type="book", resource_id=book_id, resource_title=book_file.book.title,
+          details={"format": book_file.format, "filename": filename})
+    return FileResponse(
+        str(serve_path),
+        media_type="application/octet-stream",
+        filename=filename,
+    )
+
+
+# ── Comic page streaming ──────────────────────────────────────────────────────
+
+_page_list_cache: dict[str, tuple[float, list[str]]] = {}
+
+_IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.avif')
+_MEDIA_TYPES = {
+    'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
+    'webp': 'image/webp', 'gif': 'image/gif', 'bmp': 'image/bmp', 'avif': 'image/avif',
+}
+
+
+def _get_comic_pages_zip(file_path: Path) -> list[str]:
+    """Get sorted image filenames from a CBZ archive, with mtime-based caching."""
+    import zipfile
+    key = str(file_path)
+    mtime = file_path.stat().st_mtime
+    cached = _page_list_cache.get(key)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    with zipfile.ZipFile(file_path, 'r') as zf:
+        images = sorted(
+            n for n in zf.namelist()
+            if n.lower().endswith(_IMAGE_EXTS) and not n.startswith('__MACOSX')
+        )
+    _page_list_cache[key] = (mtime, images)
+    return images
+
+
+@router.get("/{book_id}/pages")
+def get_comic_pages(
+    book_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get page list for a comic book (CBZ/CBR)."""
+    book = db.get(Book, book_id)
+    if not book or not user_can_see_book(db, current_user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
+    comic_file = db.query(BookFile).filter(
+        BookFile.book_id == book_id,
+        BookFile.format.in_(["cbz", "cbr"]),
+    ).first()
+    if not comic_file:
+        raise HTTPException(status_code=404, detail="No comic file for this book")
+
+    file_path = Path(comic_file.file_path)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    if comic_file.format == "cbr":
+        try:
+            import rarfile
+            with rarfile.RarFile(str(file_path)) as rf:
+                images = sorted(
+                    n for n in rf.namelist()
+                    if n.lower().endswith(_IMAGE_EXTS)
+                )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to read CBR: {exc}")
+        return {"total": len(images), "pages": [{"index": i, "filename": n} for i, n in enumerate(images)]}
+
+    images = _get_comic_pages_zip(file_path)
+    return {"total": len(images), "pages": [{"index": i, "filename": n} for i, n in enumerate(images)]}
+
+
+@router.get("/{book_id}/pages/{page_index}")
+def get_comic_page(
+    book_id: int,
+    page_index: int,
+    token: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """Serve a single page image from a comic book archive.
+    Uses ?token= query param auth (img tags can't send Authorization headers)."""
+    from jose import JWTError, jwt as jose_jwt
+    from backend.core.config import settings as app_settings
+    from backend.core.security import _signing_key
+    from backend.models.user import User as UserModel
+
+    try:
+        payload = jose_jwt.decode(token, _signing_key(), algorithms=[app_settings.jwt_algorithm])
+        user_id = int(payload.get("sub", 0))
+    except (JWTError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = db.get(UserModel, user_id)
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User not found")
+    book = db.get(Book, book_id)
+    if not book or not user_can_see_book(db, user, book):
+        raise HTTPException(status_code=404, detail="Book not found")
+    comic_file = db.query(BookFile).filter(
+        BookFile.book_id == book_id,
+        BookFile.format.in_(["cbz", "cbr"]),
+    ).first()
+    if not comic_file:
+        raise HTTPException(status_code=404, detail="No comic file for this book")
+
+    file_path = Path(comic_file.file_path)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    if comic_file.format == "cbr":
+        try:
+            import rarfile
+            with rarfile.RarFile(str(file_path)) as rf:
+                images = sorted(
+                    n for n in rf.namelist()
+                    if n.lower().endswith(_IMAGE_EXTS)
+                )
+                if page_index < 0 or page_index >= len(images):
+                    raise HTTPException(status_code=404, detail="Page not found")
+                data = rf.read(images[page_index])
+                ext = images[page_index].rsplit('.', 1)[-1].lower()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to read CBR: {exc}")
+        media = _MEDIA_TYPES.get(ext, 'application/octet-stream')
+        return Response(content=data, media_type=media, headers={"Cache-Control": "public, max-age=86400"})
+
+    import zipfile
+    images = _get_comic_pages_zip(file_path)
+    if page_index < 0 or page_index >= len(images):
+        raise HTTPException(status_code=404, detail="Page not found")
+    with zipfile.ZipFile(file_path, 'r') as zf:
+        data = zf.read(images[page_index])
+    ext = images[page_index].rsplit('.', 1)[-1].lower()
+    media = _MEDIA_TYPES.get(ext, 'application/octet-stream')
+    return Response(content=data, media_type=media, headers={"Cache-Control": "public, max-age=86400"})
+
+
+@router.get("/{book_id}/read.cbz")
+def read_cbz(book_id: int, token: str = Query(...), db: Session = Depends(get_db)):
+    """Serve CBZ/CBR file for the comic reader."""
+    from jose import JWTError, jwt as jose_jwt
+    from backend.core.security import _signing_key
+    from backend.models.user import User as UserModel
+
+    try:
+        payload = jose_jwt.decode(token, _signing_key(), algorithms=[settings.jwt_algorithm])
+        user_id = int(payload.get("sub", 0))
+    except (JWTError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = db.get(UserModel, user_id)
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    # Find CBZ or CBR file
+    comic_file = db.query(BookFile).filter(
+        BookFile.book_id == book_id,
+        BookFile.format.in_(["cbz", "cbr"])
+    ).first()
+    if not comic_file:
+        raise HTTPException(status_code=404, detail="No comic file for this book")
+
+    from backend.core.permissions import user_can_see_book
+    if not user_can_see_book(db, user, comic_file.book):
+        raise HTTPException(status_code=404, detail="No comic file for this book")
+
+    file_path = Path(comic_file.file_path)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    # CBR needs repacking to ZIP for the frontend reader
+    if comic_file.format == "cbr":
+        import rarfile
+        import zipfile
+
+        cache_dir = Path(settings.data_dir) / "cache"
+        cache_dir.mkdir(exist_ok=True)
+        cached = cache_dir / f"{comic_file.content_hash or comic_file.id}.cbz"
+
+        if not cached.exists():
+            with rarfile.RarFile(str(file_path)) as rf:
+                with zipfile.ZipFile(str(cached), 'w') as zf:
+                    for entry in rf.infolist():
+                        if not entry.is_dir():
+                            zf.writestr(entry.filename, rf.read(entry))
+
+        file_path = cached
+
+    return FileResponse(str(file_path), media_type="application/x-cbz")
+
+
+@router.get("/{book_id}/read.pdf")
+def read_pdf(book_id: int, token: str = Query(...), db: Session = Depends(get_db)):
+    """Serve PDF file for the reader."""
+    from jose import JWTError, jwt as jose_jwt
+    from backend.core.security import _signing_key
+    from backend.models.user import User as UserModel
+
+    try:
+        payload = jose_jwt.decode(token, _signing_key(), algorithms=[settings.jwt_algorithm])
+        user_id = int(payload.get("sub", 0))
+    except (JWTError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = db.get(UserModel, user_id)
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    pdf_file = db.query(BookFile).filter(
+        BookFile.book_id == book_id,
+        BookFile.format == "pdf"
+    ).first()
+    if not pdf_file:
+        raise HTTPException(status_code=404, detail="No PDF file for this book")
+
+    from backend.core.permissions import user_can_see_book
+    if not user_can_see_book(db, user, pdf_file.book):
+        raise HTTPException(status_code=404, detail="No PDF file for this book")
+
+    file_path = Path(pdf_file.file_path)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    return FileResponse(str(file_path), media_type="application/pdf")
+
+
+@router.get("/{book_id}/read.epub")
+def read_epub(
+    book_id: int,
+    token: str = Query(..., description="JWT token for epub.js auth"),
+    db: Session = Depends(get_db),
+):
+    """Serve the EPUB file for in-browser reading. Accepts JWT as a query param
+    so epub.js can fetch it by URL (it cannot send Authorization headers)."""
+    from jose import JWTError, jwt as jose_jwt
+    from backend.core.security import _signing_key
+    from backend.models.user import User as UserModel
+
+    try:
+        payload = jose_jwt.decode(token, _signing_key(), algorithms=[settings.jwt_algorithm])
+        user_id = int(payload.get("sub", 0))
+    except (JWTError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = db.get(UserModel, user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    epub_file = (
+        db.query(BookFile)
+        .filter(BookFile.book_id == book_id, BookFile.format == "epub")
+        .first()
+    )
+    if not epub_file:
+        raise HTTPException(status_code=404, detail="No EPUB file for this book")
+
+    from backend.core.permissions import user_can_see_book
+    if not user_can_see_book(db, user, epub_file.book):
+        raise HTTPException(status_code=404, detail="No EPUB file for this book")
+
+    file_path = Path(epub_file.file_path)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File no longer on disk")
+
+    return FileResponse(str(file_path), media_type="application/epub+zip")
+
+
+def _delete_book_record(book: Book, db: Session, actor: User) -> None:
+    """Delete a book row, then its files and cover on disk.
+
+    Delete the row first, remove files after. A crash between the two leaves
+    orphaned files that the next scan re-imports; the reverse order leaves a
+    permanent ghost row (files gone, nothing on disk to heal it from).
+    """
+    deleted_id, deleted_title = book.id, book.title
+    file_paths = [Path(bf.file_path) for bf in book.files]
+    cover_file = settings.covers_dir / book.cover_path if book.cover_path else None
+
+    from backend.services.fts import unindex_book
+    unindex_book(db, book.id)
+    db.delete(book)
+    db.commit()
+
+    audit(db, "books.deleted", user_id=actor.id, username=actor.username,
+          resource_type="book", resource_id=deleted_id, resource_title=deleted_title)
+
+    from backend.services.metadata_embed import purge_book_cache
+    purge_book_cache(deleted_id)
+
+    for fp in file_paths:
+        try:
+            fp.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("delete_book: could not remove file %s", fp)
+            continue
+        try:
+            fp.parent.rmdir()  # remove parent directory if now empty
+        except OSError:
+            pass
+
+    if cover_file is not None:
+        try:
+            cover_file.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("delete_book: could not remove cover %s", cover_file)
+
+
+class BulkDeleteRequest(PydanticBaseModel):
+    book_ids: list[int]
+
+
+@router.post("/bulk-delete")
+def bulk_delete_books(
+    req: BulkDeleteRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete several books (and their files on disk) in one request.
+
+    Same permission rules as the single delete: members only their own
+    uploads, admins any book. Failures are reported per book instead of
+    aborting the batch.
+    """
+    require_role(current_user, "member")
+
+    if not req.book_ids:
+        raise HTTPException(status_code=400, detail="book_ids must not be empty")
+    if len(req.book_ids) > 500:
+        raise HTTPException(status_code=400, detail="At most 500 books per request")
+
+    from backend.core.permissions import is_admin as _is_admin
+
+    deleted: list[int] = []
+    errors: list[dict] = []
+    for book_id in dict.fromkeys(req.book_ids):  # dedupe, keep order
+        book = db.query(Book).filter(Book.id == book_id).first()
+        if not book:
+            errors.append({"book_id": book_id, "error": "Book not found"})
+            continue
+        if not _is_admin(current_user) and book.added_by != current_user.id:
+            errors.append({"book_id": book_id, "error": "You can only delete books you uploaded"})
+            continue
+        try:
+            _delete_book_record(book, db, current_user)
+            deleted.append(book_id)
+        except Exception as e:
+            db.rollback()
+            logger.warning("bulk_delete: failed to delete book %s: %s", book_id, e)
+            errors.append({"book_id": book_id, "error": str(e)})
+
+    return {"deleted": deleted, "errors": errors}
+
+
+@router.delete("/{book_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_book(
+    book_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    require_role(current_user, "member")
+
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    # Members can only delete their own uploads; admins can delete any book
+    from backend.core.permissions import is_admin as _is_admin
+    if not _is_admin(current_user) and book.added_by != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only delete books you uploaded")
+
+    _delete_book_record(book, db, current_user)
+
+
+
+
+@router.post("/upload", response_model=BookDetailOut, status_code=status.HTTP_201_CREATED)
+def upload_book(
+    file: UploadFile = File(...),
+    book_type_id: Optional[int] = Form(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    require_role(current_user, "member")
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename")
+
+    suffix = Path(file.filename).suffix.lower().lstrip(".")
+    if suffix not in ALLOWED_FORMATS:
+        raise HTTPException(status_code=400, detail=f"Unsupported format: {suffix}")
+
+    # Write to a temp location first so we can extract metadata before deciding the path
+    tmp_dir = settings.incoming_dir / ".tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(file.filename).name  # strip any path components from client filename
+    if not safe_name or safe_name in (".", ".."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    tmp_path = tmp_dir / safe_name
+    # Defense in depth: confirm resolved path stays inside tmp_dir
+    if tmp_dir.resolve() not in tmp_path.resolve().parents:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    try:
+        with open(tmp_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+    finally:
+        file.file.close()
+
+    # Duplicate check by hash
+    content_hash = sha256_file(tmp_path)
+    existing = db.query(Book).filter(Book.content_hash == content_hash).first()
+    if existing:
+        already_file = db.query(BookFile).filter(BookFile.content_hash == content_hash).first()
+        if not already_file:
+            meta = extract_metadata(tmp_path, settings.covers_dir)
+            rel = get_library_path(meta, file.filename)
+            dest = resolve_unique_path(settings.library_dir, rel)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(tmp_path), str(dest))
+            db.add(BookFile(
+                book_id=existing.id,
+                file_path=str(dest.resolve()),
+                format=suffix,
+                file_size=dest.stat().st_size,
+                content_hash=content_hash,
+            ))
+            record_ko_hash(db, existing.id, ko_partial_md5(dest), "raw")
+        else:
+            tmp_path.unlink(missing_ok=True)
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    # New book — extract metadata, determine library path, move
+    meta = extract_metadata(tmp_path, settings.covers_dir)
+    rel = get_library_path(meta, file.filename)
+    dest = resolve_unique_path(settings.library_dir, rel)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(tmp_path), str(dest))
+
+    # Auto-detect book type if not explicitly provided
+    if not book_type_id:
+        from backend.models.library import BookType
+        if meta.get("_is_manga"):
+            manga_type = db.query(BookType).filter(BookType.slug == "manga").first()
+            if manga_type:
+                book_type_id = manga_type.id
+        elif suffix in ("cbz", "cbr"):
+            comic_type = db.query(BookType).filter(BookType.slug == "comic").first()
+            if comic_type:
+                book_type_id = comic_type.id
+
+    book = Book(
+        title=meta.get("title", Path(file.filename).stem),
+        author=meta.get("author"),
+        series=meta.get("series"),
+        series_index=meta.get("series_index"),
+        isbn=meta.get("isbn"),
+        publisher=meta.get("publisher"),
+        description=meta.get("description"),
+        language=meta.get("language"),
+        year=meta.get("year"),
+        word_count=meta.get("word_count"),
+        page_count=meta.get("page_count"),
+        cover_path=meta.get("cover_path"),
+        content_hash=content_hash,
+        status="active",
+        added_by=current_user.id,
+        book_type_id=book_type_id,
+    )
+    db.add(book)
+    db.flush()
+
+    from backend.services.chapters import replace_book_chapters
+    replace_book_chapters(db, book.id, meta.get("_chapters"))
+
+    db.add(BookFile(
+        book_id=book.id,
+        file_path=str(dest.resolve()),
+        format=suffix,
+        file_size=dest.stat().st_size,
+        content_hash=content_hash,
+    ))
+    record_ko_hash(db, book.id, ko_partial_md5(dest), "raw")
+
+    # Create genre tags from embedded metadata (epub dc:subject / CBZ ComicInfo)
+    if meta.get("_genres"):
+        from backend.models.book import BookTag
+        source = meta.get("_genre_source", "comic_info")
+        for genre in meta["_genres"]:
+            existing = db.query(BookTag).filter(
+                BookTag.book_id == book.id,
+                BookTag.tag == genre,
+            ).first()
+            if not existing:
+                db.add(BookTag(book_id=book.id, tag=genre, source=source))
+
+    db.flush()
+    from backend.services.fts import index_book
+    index_book(db, book)
+    db.commit()
+
+    if book_type_id:
+        from backend.models.library import BookType as BT
+        from backend.services.book_types import assign_book_to_type_library
+        bt = db.get(BT, book_type_id)
+        if bt:
+            assign_book_to_type_library(db, book, bt)
+
+    # Wishlist matcher — find open wishes that match the new book
+    from backend.services.wish_matcher import match_on_book_created
+    matched_wishes = match_on_book_created(db, book)
+
+    db.refresh(book)
+    audit(db, "books.uploaded", user_id=current_user.id, username=current_user.username,
+          resource_type="book", resource_id=book.id, resource_title=book.title,
+          details={"format": suffix})
+
+    # Surface matched wish IDs in the response for the admin post-upload prompt
+    out = BookDetailOut.model_validate(book)
+    if matched_wishes:
+        out.matched_wish_ids = [w.id for w in matched_wishes]
+    return out
+
+
+# ── Scribe: batch-import helpers ──────────────────────────────────────────────
+
+class CheckHashesRequest(PydanticBaseModel):
+    hashes: list[str]
+
+
+class CheckHashesResponse(PydanticBaseModel):
+    existing: dict[str, int]  # hash -> book_id
+
+
+@router.post("/check-hashes", response_model=CheckHashesResponse)
+def check_hashes(
+    body: CheckHashesRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return a map of content_hash -> book_id for hashes that already exist and
+    are visible to the calling user.  Used by the Scribe batch-import skill to
+    skip files that Tome already knows about."""
+    from backend.core.permissions import book_visibility_filter
+
+    if not body.hashes:
+        return CheckHashesResponse(existing={})
+
+    # Check Book.content_hash
+    visibility = book_visibility_filter(db, current_user)
+    book_rows = (
+        db.query(Book.id, Book.content_hash)
+        .filter(
+            Book.status == "active",
+            Book.content_hash.in_(body.hashes),
+            visibility,
+        )
+        .all()
+    )
+
+    existing: dict[str, int] = {}
+    for book_id, h in book_rows:
+        if h and h not in existing:
+            existing[h] = book_id
+
+    # Also check BookFile.content_hash for hashes not already matched
+    remaining = [h for h in body.hashes if h not in existing]
+    if remaining:
+        file_rows = (
+            db.query(BookFile.content_hash, BookFile.book_id)
+            .join(Book, Book.id == BookFile.book_id)
+            .filter(
+                Book.status == "active",
+                BookFile.content_hash.in_(remaining),
+                visibility,
+            )
+            .all()
+        )
+        for h, book_id in file_rows:
+            if h and h not in existing:
+                existing[h] = book_id
+
+    return CheckHashesResponse(existing=existing)
+
+
+class IngestMetadata(PydanticBaseModel):
+    title: str
+    subtitle: Optional[str] = None
+    author: Optional[str] = None
+    series: Optional[str] = None
+    series_index: Optional[float] = None
+    isbn: Optional[str] = None
+    publisher: Optional[str] = None
+    description: Optional[str] = None
+    language: Optional[str] = None
+    year: Optional[int] = None
+    tags: Optional[list[str]] = None
+    library_ids: Optional[list[int]] = None
+    book_type_id: Optional[int] = None
+
+
+@router.post("/ingest", response_model=BookDetailOut, status_code=status.HTTP_201_CREATED)
+def ingest_book(
+    file: UploadFile = File(...),
+    metadata: str = Form(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Scribe endpoint: upload a file with caller-supplied metadata (no auto-extraction).
+
+    - Caller is authoritative for all metadata fields.
+    - Deduplication: if the file's content_hash already exists in DB, returns 409.
+    - Library assignment: uses library_ids if provided, else the book_type's auto-library,
+      else leaves unassigned.
+    - Sets is_reviewed=True (caller has already reviewed the book).
+    - Writes a ``book.ingest`` audit entry.
+    """
+    require_role(current_user, "member")
+
+    # Parse the metadata JSON blob
+    try:
+        meta = IngestMetadata.model_validate_json(metadata)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid metadata JSON: {exc}") from exc
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename")
+
+    suffix = Path(file.filename).suffix.lower().lstrip(".")
+    if suffix not in ALLOWED_FORMATS:
+        raise HTTPException(status_code=400, detail=f"Unsupported format: {suffix}")
+
+    # Write to a temp location so we can compute hash before deciding path
+    tmp_dir = settings.incoming_dir / ".tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(file.filename).name
+    if not safe_name or safe_name in (".", ".."):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    tmp_path = tmp_dir / safe_name
+    if tmp_dir.resolve() not in tmp_path.resolve().parents:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    try:
+        with open(tmp_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+    finally:
+        file.file.close()
+
+    # Deduplicate by content hash
+    content_hash = sha256_file(tmp_path)
+    existing_book = (
+        db.query(Book)
+        .filter(
+            (Book.content_hash == content_hash) | Book.files.any(BookFile.content_hash == content_hash)
+        )
+        .first()
+    )
+    if existing_book:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=409,
+            detail={"detail": "duplicate", "existing_id": existing_book.id},
+        )
+
+    # Determine library path using organizer (same as upload endpoint)
+    path_meta: dict = {
+        "title": meta.title,
+        "author": meta.author,
+        "series": meta.series,
+        "series_index": meta.series_index,
+        "year": meta.year,
+    }
+    rel = get_library_path(path_meta, file.filename)
+    dest = resolve_unique_path(settings.library_dir, rel)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(tmp_path), str(dest))
+
+    book = Book(
+        title=meta.title,
+        subtitle=meta.subtitle,
+        author=meta.author,
+        series=meta.series,
+        series_index=meta.series_index,
+        isbn=meta.isbn,
+        publisher=meta.publisher,
+        description=meta.description,
+        language=meta.language,
+        year=meta.year,
+        content_hash=content_hash,
+        status="active",
+        is_reviewed=True,
+        added_by=current_user.id,
+        book_type_id=meta.book_type_id,
+    )
+    db.add(book)
+    db.flush()
+
+    db.add(BookFile(
+        book_id=book.id,
+        file_path=str(dest.resolve()),
+        format=suffix,
+        file_size=dest.stat().st_size,
+        content_hash=content_hash,
+    ))
+    record_ko_hash(db, book.id, ko_partial_md5(dest), "raw")
+
+    # Word count + chapter map (EPUB only) — parsed from the ingested file on
+    # disk. Fixed-layout formats get an intrinsic page count instead.
+    if suffix == "epub":
+        from backend.services.metadata import count_words_epub, extract_chapters_epub
+        from backend.services.chapters import replace_book_chapters
+        book.word_count = count_words_epub(dest)
+        replace_book_chapters(db, book.id, extract_chapters_epub(dest))
+    elif suffix in ("pdf", "cbz", "cbr"):
+        from backend.services.metadata import count_pages_fixed_layout
+        book.page_count = count_pages_fixed_layout(dest)
+
+    # Tags
+    if meta.tags:
+        for tag_str in meta.tags:
+            tag_str = tag_str.strip()
+            if tag_str:
+                db.add(BookTag(book_id=book.id, tag=tag_str, source="user"))
+
+    db.flush()
+    from backend.services.fts import index_book
+    index_book(db, book)
+    db.commit()
+
+    # Library assignment
+    if meta.library_ids:
+        from backend.models.library import Library as Lib
+        libs = db.query(Lib).filter(Lib.id.in_(meta.library_ids)).all()
+        for lib in libs:
+            if lib not in book.libraries:
+                book.libraries.append(lib)
+        db.commit()
+    elif meta.book_type_id:
+        from backend.models.library import BookType as BT
+        from backend.services.book_types import assign_book_to_type_library
+        bt = db.get(BT, meta.book_type_id)
+        if bt:
+            assign_book_to_type_library(db, book, bt)
+
+    # Wishlist matcher — find open wishes that match the new book
+    from backend.services.wish_matcher import match_on_book_created
+    matched_wishes = match_on_book_created(db, book)
+
+    db.refresh(book)
+    audit(
+        db,
+        "book.ingest",
+        user_id=current_user.id,
+        username=current_user.username,
+        resource_type="book",
+        resource_id=book.id,
+        resource_title=book.title,
+        details={"format": suffix},
+    )
+
+    # Surface matched wish IDs in the response for the admin post-upload prompt
+    out = BookDetailOut.model_validate(book)
+    if matched_wishes:
+        out.matched_wish_ids = [w.id for w in matched_wishes]
+    return out
+
+
+# ── Fetch metadata candidates ─────────────────────────────────────────────────
+
+@router.get("/{book_id}/fetch-metadata")
+async def fetch_metadata(
+    book_id: int,
+    q: Optional[str] = Query(None, description="Override search query"),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Search external sources; return ranked candidates + per-source status.
+
+    Candidates are cross-source merged and relevance-ranked (index 0 = best).
+    ``sources`` tells the UI when an empty list means "rate limited", not
+    "this book doesn't exist anywhere".
+    """
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    result = await fetch_candidates(
+        title=book.title,
+        author=book.author,
+        isbn=book.isbn,
+        series=book.series,
+        series_index=book.series_index,
+        query_override=q,
+        year=book.year,
+        language=book.language,
+        media_hint=book.book_type.slug if book.book_type else None,
+    )
+    return {
+        "candidates": [MetadataCandidateOut.model_validate(c.__dict__) for c in result.candidates],
+        "query_used": result.query_used,
+        "sources": result.sources,
+    }
+
+
+# ── Apply selected metadata ───────────────────────────────────────────────────
+
+@router.post("/{book_id}/apply-metadata", response_model=BookDetailOut)
+async def apply_metadata(
+    book_id: int,
+    body: ApplyMetadataRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Apply only the explicitly passed fields from a chosen candidate."""
+    require_role(current_user, "member")
+
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    # Apply scalar fields if provided
+    simple_fields = ("title", "author", "description", "publisher", "year", "language", "isbn", "series", "series_index")
+    for f in simple_fields:
+        val = getattr(body, f)
+        if val is not None:
+            setattr(book, f, val)
+
+    # Replace FETCHED tags if provided — but never wipe hand-curated ones
+    # (source="user"); applying a candidate used to delete the user's own tags.
+    if body.tags is not None:
+        kept = (
+            db.query(BookTag)
+            .filter(BookTag.book_id == book_id, BookTag.source == "user")
+            .all()
+        )
+        kept_lower = {t.tag.lower() for t in kept}
+        db.query(BookTag).filter(BookTag.book_id == book_id, BookTag.source != "user").delete()
+        for tag in body.tags:
+            tag = tag.strip()
+            if tag and tag.lower() not in kept_lower:
+                db.add(BookTag(book_id=book_id, tag=tag, source="metadata_fetch"))
+
+    # Download and replace cover if requested
+    if body.cover_url:
+        try:
+            cover_data = await fetch_safe_image(body.cover_url)
+        except UnsafeURLError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid cover URL: {exc}")
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Cover download failed: {exc}")
+
+        cover_filename = f"book_{book_id}_fetched.jpg"
+        cover_path = settings.covers_dir / cover_filename
+        cover_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if book.cover_path:
+            old = settings.covers_dir / book.cover_path
+            old.unlink(missing_ok=True)
+
+        cover_path.write_bytes(cover_data)
+        book.cover_path = cover_filename
+
+    db.flush()
+    from backend.services.fts import index_book
+    index_book(db, book)
+    db.commit()
+    db.refresh(book)
+    return book
+
+
+# ── Batch status fetch ────────────────────────────────────────────────────────
+
+from pydantic import BaseModel as _BaseModel
+from backend.models.user_book_status import UserBookStatus
+
+
+class StatusBatchRequest(_BaseModel):
+    book_ids: list[int]
+
+
+@router.post("/statuses")
+def get_book_statuses(
+    body: StatusBatchRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    from backend.models.user_series_rating import UserSeriesRating
+
+    # Own per-volume status rows
+    rows = db.query(UserBookStatus).filter(
+        UserBookStatus.user_id == current_user.id,
+        UserBookStatus.book_id.in_(body.book_ids),
+    ).all()
+    own = {row.book_id: row for row in rows}
+
+    # Series of the requested books → the user's series ratings (for inheritance)
+    book_series = dict(
+        db.query(Book.id, Book.series).filter(Book.id.in_(body.book_ids)).all()
+    )
+    wanted_series = {s for s in book_series.values() if s}
+    series_ratings: dict[str, int] = {}
+    if wanted_series:
+        for sr in db.query(UserSeriesRating).filter(
+            UserSeriesRating.user_id == current_user.id,
+            UserSeriesRating.series_name.in_(wanted_series),
+            UserSeriesRating.rating.isnot(None),
+        ).all():
+            series_ratings[sr.series_name] = sr.rating
+
+    result: dict[str, dict] = {}
+    for bid in body.book_ids:
+        row = own.get(bid)
+        inherited = series_ratings.get(book_series.get(bid) or "")
+        effective = (row.rating if row and row.rating is not None else inherited)
+        # Only emit an entry when there's something to say (a status row or an
+        # inherited rating) — keeps the payload sparse like before.
+        if row is None and effective is None:
+            continue
+        result[str(bid)] = {
+            "status": row.status if row else "unread",
+            "progress_pct": row.progress_pct if row else None,
+            "rating": effective,
+        }
+    return result

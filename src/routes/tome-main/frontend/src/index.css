@@ -1,0 +1,449 @@
+@import "./fonts.css";
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-success: var(--success);
+  --color-info: var(--info);
+  --color-warning: var(--warning);
+  --color-rating: var(--rating);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-accent-soft: var(--accent-soft);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+/* Light — near-neutral paper + oxblood (bookbinding leather).
+   Kept a touch off pure white, but visibly cooler than Amber —
+   Light/Dark are the neutral pair, Amber/Ember the warm pair. */
+:root {
+  --radius: 0.625rem;
+  --background: oklch(0.975 0.003 85);
+  --foreground: oklch(0.21 0.012 60);
+  --card: oklch(0.995 0.002 85);
+  --card-foreground: oklch(0.21 0.012 60);
+  --popover: oklch(0.995 0.002 85);
+  --popover-foreground: oklch(0.21 0.012 60);
+  --primary: oklch(0.45 0.115 18);
+  --primary-foreground: oklch(0.98 0.005 85);
+  --secondary: oklch(0.94 0.004 85);
+  --secondary-foreground: oklch(0.27 0.012 60);
+  --muted: oklch(0.94 0.004 85);
+  --muted-foreground: oklch(0.50 0.010 70);
+  --accent: oklch(0.93 0.006 40);
+  --accent-foreground: oklch(0.25 0.012 60);
+  --destructive: oklch(0.55 0.21 30);
+  --success: oklch(0.52 0.10 155);
+  --info: oklch(0.50 0.09 245);
+  --warning: oklch(0.58 0.12 70);
+  /* Rating gold — muted (chroma ~0.11, same register as the rest of the palette),
+     hue 76 sits warmer than --warning (70) so it reads distinct from "Reading".
+     Light needs a deeper gold to hold contrast on near-white paper. Kept a notch
+     under the old 0.13 — a five-star grid row was the loudest color on the page. */
+  --rating: oklch(0.62 0.11 76);
+  --border: oklch(0.90 0.005 85);
+  --input: oklch(0.88 0.005 85);
+  --ring: oklch(0.45 0.115 18);
+  --chart-accent: oklch(0.52 0.13 18);
+  --accent-soft: oklch(0.45 0.115 18 / 0.12);
+}
+
+/* Dark — near-neutral with a trace of warmth (not zinc, not espresso)
+   + dusty rosewood. The accent stays calm because its chroma is low,
+   not because the surfaces are brown. */
+.dark {
+  --background: oklch(0.16 0.004 60);
+  --foreground: oklch(0.955 0.004 80);
+  --card: oklch(0.21 0.005 60);
+  --card-foreground: oklch(0.955 0.004 80);
+  --popover: oklch(0.21 0.005 60);
+  --popover-foreground: oklch(0.955 0.004 80);
+  --primary: oklch(0.64 0.12 22);
+  --primary-foreground: oklch(0.98 0.005 18);
+  --secondary: oklch(0.265 0.005 60);
+  --secondary-foreground: oklch(0.955 0.004 80);
+  --muted: oklch(0.265 0.005 60);
+  --muted-foreground: oklch(0.74 0.008 70);
+  --accent: oklch(0.265 0.005 60);
+  --accent-foreground: oklch(0.955 0.004 80);
+  --destructive: oklch(0.70 0.19 28);
+  --success: oklch(0.72 0.10 155);
+  --info: oklch(0.72 0.09 245);
+  --warning: oklch(0.78 0.11 75);
+  /* Lighter on dark surfaces so the muted gold still reads (cf. the value
+     tuned live on dark). Inherited by Ember + Black, which only override surfaces. */
+  --rating: oklch(0.71 0.10 79);
+  /* Border/input alpha and muted-foreground sit a step higher than light-theme
+     instinct suggests — at 11% the hairlines vanished on most panels and dark
+     read flat. 16% is still a hairline, it just survives being on a 0.21 card. */
+  --border: oklch(0.95 0.008 60 / 16%);
+  --input: oklch(0.95 0.008 60 / 20%);
+  --ring: oklch(0.64 0.12 22);
+  --chart-accent: oklch(0.64 0.12 22);
+  --accent-soft: oklch(0.64 0.12 22 / 0.16);
+}
+
+/* Ember — the warm cappuccino dark: espresso surfaces, same rosewood accent.
+   Dark counterpart to Amber. Applied alongside .dark; overrides surfaces only. */
+.theme-ember {
+  --background: oklch(0.175 0.012 60);
+  --card: oklch(0.225 0.014 60);
+  --popover: oklch(0.225 0.014 60);
+  --secondary: oklch(0.28 0.015 60);
+  --muted: oklch(0.28 0.015 60);
+  --accent: oklch(0.28 0.015 60);
+  --muted-foreground: oklch(0.74 0.015 70);
+  --border: oklch(0.95 0.015 60 / 16%);
+  --input: oklch(0.95 0.015 60 / 20%);
+}
+
+/* Black — true-black OLED theme, same wine identity.
+   Class is applied alongside .dark, so it only needs to override surfaces. */
+.theme-black {
+  --background: oklch(0 0 0);
+  --card: oklch(0.145 0.003 60);
+  --popover: oklch(0.145 0.003 60);
+  --secondary: oklch(0.20 0.004 60);
+  --muted: oklch(0.20 0.004 60);
+  --accent: oklch(0.20 0.004 60);
+  --primary: oklch(0.67 0.12 22);
+  --ring: oklch(0.67 0.12 22);
+  --chart-accent: oklch(0.67 0.12 22);
+  --accent-soft: oklch(0.67 0.12 22 / 0.18);
+  --border: oklch(1 0 0 / 17%);
+  --input: oklch(1 0 0 / 21%);
+}
+
+/* Amber (warm parchment) theme */
+.theme-amber {
+  --background: oklch(0.972 0.009 70);
+  --foreground: oklch(0.17 0.022 52);
+  --card: oklch(0.998 0.002 70);
+  --card-foreground: oklch(0.17 0.022 52);
+  --popover: oklch(0.998 0.002 70);
+  --popover-foreground: oklch(0.17 0.022 52);
+  --primary: oklch(0.50 0.155 52);
+  --primary-foreground: oklch(0.99 0.003 70);
+  --secondary: oklch(0.935 0.012 70);
+  --secondary-foreground: oklch(0.30 0.02 52);
+  --muted: oklch(0.935 0.01 70);
+  --muted-foreground: oklch(0.47 0.022 52);
+  --accent: oklch(0.925 0.018 52);
+  --accent-foreground: oklch(0.24 0.022 52);
+  --destructive: oklch(0.55 0.2 25);
+  --success: oklch(0.51 0.10 150);
+  --info: oklch(0.50 0.085 245);
+  --warning: oklch(0.56 0.13 65);
+  /* Warm parchment runs warmer overall; deepen the gold a touch to hold contrast. */
+  --rating: oklch(0.60 0.115 74);
+  --border: oklch(0.89 0.012 70);
+  --input: oklch(0.87 0.013 70);
+  --ring: oklch(0.50 0.155 52);
+  --chart-accent: oklch(0.56 0.155 52);
+  --accent-soft: oklch(0.50 0.155 52 / 0.12);
+}
+
+/* Card stagger entrance animation */
+@keyframes card-appear {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-card-appear {
+  animation: card-appear 0.25s ease-out both;
+}
+
+/* Soft fade when the library switches between grid and list */
+@keyframes view-fade {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* Focus-mode rotary: panel text cross-fades as you rotate to another volume */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* Focus-mode cover bloom — a soft black halo on light themes, a neutral light
+   halo on dark (a black shadow is invisible against a near-black background). */
+:root {
+  --cover-bloom-hero: 0 6px 52px 10px rgba(0,0,0,.13), 0 2px 16px rgba(0,0,0,.07);
+  --cover-bloom-fan: 0 6px 38px 6px rgba(0,0,0,.11);
+}
+.dark {
+  --cover-bloom-hero: 0 6px 52px 10px rgba(255,255,255,.09), 0 2px 18px rgba(255,255,255,.05);
+  --cover-bloom-fan: 0 6px 40px 6px rgba(255,255,255,.06);
+}
+
+/* Cover-size slider (library toolbar) — the filled-track background is set
+   inline from React since it depends on the current value */
+.cover-slider {
+  appearance: none;
+  -webkit-appearance: none;
+  height: 0.25rem;
+  border-radius: 9999px;
+  cursor: pointer;
+}
+.cover-slider:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 3px;
+}
+.cover-slider::-webkit-slider-thumb {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 0.75rem;
+  height: 0.75rem;
+  border-radius: 9999px;
+  background: var(--primary);
+  transition: transform 0.15s ease;
+}
+.cover-slider:hover::-webkit-slider-thumb,
+.cover-slider:active::-webkit-slider-thumb {
+  transform: scale(1.3);
+}
+.cover-slider::-moz-range-thumb {
+  width: 0.75rem;
+  height: 0.75rem;
+  border: none;
+  border-radius: 9999px;
+  background: var(--primary);
+  transition: transform 0.15s ease;
+}
+.cover-slider:hover::-moz-range-thumb,
+.cover-slider:active::-moz-range-thumb {
+  transform: scale(1.3);
+}
+
+/* Sidebar icon wiggle on hover */
+@keyframes wiggle {
+  0%, 100% { transform: rotate(0deg); }
+  25% { transform: rotate(-12deg); }
+  75% { transform: rotate(12deg); }
+}
+
+/* Reading status pop animation */
+@keyframes pop {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.15); }
+  100% { transform: scale(1); }
+}
+
+/* Cover shimmer placeholder */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+/* ── Book animations (BookAnimation component) ───────────────────────────
+   One SVG book (left-page / right-page / spine), stroke = currentColor so it
+   inherits the theme via text-* utilities. transform-box: view-box keeps the
+   px transform-origins mapped to the 64-unit viewBox, so motion is correct at
+   any render size. */
+.book-anim svg { width: 100%; height: 100%; overflow: visible; }
+.book-anim path,
+.book-anim line { stroke: currentColor; fill: none; }
+.book-anim g.book,
+.book-anim .left-page,
+.book-anim .right-page,
+.book-anim .spine,
+.book-anim .pg { transform-box: view-box; }
+.book-anim .left-page,
+.book-anim .right-page { transform-origin: 32px 35px; }
+.book-anim .spine { transform-origin: 32px 37px; }
+.book-anim g.book { transform-origin: 32px 32px; }
+.book-anim .ba-shadow { fill: currentColor; stroke: none; opacity: 0.3; }
+
+/* Levitate — vertical bob with a breathing shadow (hero / login) */
+.book-anim--levitate.is-playing g.book { animation: ba-floaty 3.2s ease-in-out infinite; }
+.book-anim--levitate.is-playing .ba-shadow { animation: ba-shadowpulse 3.2s ease-in-out infinite; transform-origin: center; }
+@keyframes ba-floaty { 0%,100% { transform: translateY(0) rotate(-2deg); } 50% { transform: translateY(-7px) rotate(2deg); } }
+@keyframes ba-shadowpulse { 0%,100% { transform: scaleX(1); opacity: .3; } 50% { transform: scaleX(.78); opacity: .15; } }
+
+/* Refresh — full Y spin with anticipation + settle (rescan / wait states) */
+.book-anim--refresh.is-playing g.book { animation: ba-flip360 1.5s ease-in-out infinite; }
+@keyframes ba-flip360 {
+  0%,12% { transform: perspective(400px) rotateY(0); }
+  20%    { transform: perspective(400px) rotateY(-24deg); }
+  72%    { transform: perspective(400px) rotateY(360deg); }
+  84%    { transform: perspective(400px) rotateY(350deg); }
+  92%    { transform: perspective(400px) rotateY(363deg); }
+  100%   { transform: perspective(400px) rotateY(360deg); }
+}
+
+/* Send — closes then whooshes off (send-to-device success) */
+.book-anim--send.is-playing g.book { animation: ba-whoosh 2.6s linear infinite; }
+.book-anim--send.is-playing .left-page { animation: ba-closeL 2.6s ease-in infinite; }
+.book-anim--send.is-playing .right-page { animation: ba-closeR 2.6s ease-in infinite; }
+@keyframes ba-closeL { 0%,8% { transform: rotateY(0); } 25%,100% { transform: perspective(300px) rotateY(34deg); } }
+@keyframes ba-closeR { 0%,8% { transform: rotateY(0); } 25%,100% { transform: perspective(300px) rotateY(-34deg); } }
+@keyframes ba-whoosh {
+  0%,24% { transform: translate(0,0) scale(1) rotate(0); opacity: 1; }
+  34%    { transform: translate(-5px,6px) scale(.90) rotate(-9deg); opacity: 1; }
+  44%    { transform: translate(-1px,1px) scale(1.05) rotate(-3deg); opacity: 1; }
+  60%    { transform: translate(12px,-10px) scale(.62) rotate(10deg); opacity: .95; }
+  100%   { transform: translate(56px,-48px) scale(.04) rotate(34deg); opacity: 0; }
+}
+
+/* Riffle — continuous page sweep (loader) */
+.book-anim--riffle.is-playing .pg { animation: ba-riffle 1.3s linear infinite; transform-origin: 32px 35px; opacity: 0; }
+.book-anim--riffle.is-playing .pg:nth-child(2) { animation-delay: 0s; }
+.book-anim--riffle.is-playing .pg:nth-child(3) { animation-delay: .12s; }
+.book-anim--riffle.is-playing .pg:nth-child(4) { animation-delay: .24s; }
+.book-anim--riffle.is-playing .pg:nth-child(5) { animation-delay: .36s; }
+@keyframes ba-riffle {
+  0%   { transform: perspective(300px) rotateY(0); opacity: 0; }
+  20%  { opacity: 1; }
+  80%  { opacity: 1; }
+  100% { transform: perspective(300px) rotateY(-120deg); opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .book-anim.is-playing g.book,
+  .book-anim.is-playing .left-page,
+  .book-anim.is-playing .right-page,
+  .book-anim.is-playing .pg,
+  .book-anim.is-playing .ba-shadow { animation: none !important; }
+}
+
+/* Header logo — gentle lift-and-settle on hover (matches the website). */
+@keyframes logo-bob {
+  0%   { transform: translateY(0); }
+  45%  { transform: translateY(-5px); }
+  70%  { transform: translateY(1px); }
+  100% { transform: translateY(0); }
+}
+.group:hover .logo-bob { animation: logo-bob 0.5s ease-in-out; }
+@media (prefers-reduced-motion: reduce) { .group:hover .logo-bob { animation: none; } }
+
+/* Animated loading ellipsis — three dots pulsing in sequence */
+@keyframes dot-pulse { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
+.dots-anim > span { animation: dot-pulse 1.2s infinite; }
+.dots-anim > span:nth-child(2) { animation-delay: 0.15s; }
+.dots-anim > span:nth-child(3) { animation-delay: 0.3s; }
+@media (prefers-reduced-motion: reduce) { .dots-anim > span { animation: none; } }
+
+/* iOS safe area utilities */
+.safe-top {
+  padding-top: env(safe-area-inset-top);
+}
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+/* iOS-style spring curve */
+:root {
+  --spring: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* Suppress iOS's default gray tap flash globally — we provide explicit :active feedback */
+html {
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* ── App-feel on touch devices ─────────────────────────────────────────────
+   Native browser gestures are what make the PWA feel like a website: the
+   whole viewport rubber-bands past its edges, double-tap zooms, and a long
+   press selects UI text. Kill each at the source. Pinch-zoom is handled by
+   the viewport meta (respected on Android and in the installed iOS app; a
+   Safari *tab* always allows it for accessibility). */
+html,
+body {
+  /* No scroll chaining out of the document: stops the edge bounce and
+     Android's pull-to-refresh. The app shell scrolls internally anyway. */
+  overscroll-behavior: none;
+  /* Pan and pinch stay native, double-tap-to-zoom (and its 350ms tap delay)
+     goes — taps should feel immediate, like buttons, everywhere. */
+  touch-action: manipulation;
+}
+@media (pointer: coarse) {
+  /* UI chrome is not prose: a long press on a label or a cover should do
+     nothing, not start a text selection / image callout. Text entry and the
+     reader keep native behavior (the EPUB reader renders in its own iframe,
+     so highlight-by-selection is untouched). */
+  body {
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+  input,
+  textarea,
+  [contenteditable] {
+    -webkit-user-select: text;
+    user-select: text;
+  }
+}
+
+/* Touch feedback for interactive elements */
+.touch-feedback {
+  transition: transform 0.2s var(--spring);
+  -webkit-tap-highlight-color: transparent;
+}
+.touch-feedback:active {
+  transform: scale(0.97);
+}
+
+/* Contain overscroll in nested scrollables */
+.overscroll-contain {
+  overscroll-behavior: contain;
+}
+
+* {
+  box-sizing: border-box;
+  border-color: var(--border);
+}
+
+/* Hide number input spinners */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] { -moz-appearance: textfield; }
+
+body {
+  background-color: var(--background);
+  color: var(--foreground);
+  font-family: 'Onest', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Display face — characterful grotesque for headings, page titles, book titles.
+   UI chrome (buttons, labels, badges) stays on Onest. */
+h1, h2, h3, .font-display {
+  font-family: 'Bricolage Grotesque', 'Onest', system-ui, sans-serif;
+  font-variation-settings: 'opsz' 40;
+  letter-spacing: -0.02em;
+  font-weight: 600;
+}
+
+/* Native <select>s carry the OS bezel + arrow even with Tailwind borders on
+   top — appearance-none plus our own chevron makes them match the app's
+   inputs (UX sweep finding). Gray chevron reads on light and dark grounds. */
+.tome-select {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23898581' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.6rem center;
+  padding-right: 2rem;
+}

@@ -1,0 +1,675 @@
+"""
+Bindery API — manage files in the incoming/ drop zone.
+
+Endpoints:
+  GET    /api/bindery/count        — lightweight badge count
+  GET    /api/bindery              — list pending files with parsed metadata
+  POST   /api/bindery/preview      — fetch metadata candidates for a single file
+  POST   /api/bindery/accept       — accept files into the library
+  POST   /api/bindery/reject       — delete files from the bindery
+  GET    /api/bindery/unreviewed   — list auto-imported books awaiting review
+  PUT    /api/bindery/review-all   — mark all unreviewed books as reviewed
+  PUT    /api/bindery/review/{id}  — mark a single book as reviewed
+  DELETE /api/bindery/reject/{id}  — reject (delete) an unreviewed book
+"""
+import logging
+import os
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from backend.core.config import settings
+from backend.core.database import get_db
+from backend.core.security import get_current_user
+from backend.core.permissions import require_role, is_admin
+from backend.models.book import Book, BookFile, BookTag
+from backend.models.user import User
+from backend.services.audit import audit
+from backend.services.ko_hash import ko_partial_md5, record_ko_hash
+from backend.services.book_types import assign_book_to_type_library
+from backend.services.filename_parser import parse_filename
+from backend.services.metadata import extract_metadata, sha256_file
+from backend.services.metadata_fetch import fetch_candidates
+from backend.services.organizer import get_library_path, move_into_library, resolve_unique_path
+from backend.services.safe_fetch import fetch_safe_image, UnsafeURLError
+
+router = APIRouter(tags=["bindery"])
+logger = logging.getLogger(__name__)
+
+SUPPORTED_EXTENSIONS = {".epub", ".pdf", ".cbz", ".cbr", ".mobi"}
+
+
+# ---------------------------------------------------------------------------
+# Permission helper
+# ---------------------------------------------------------------------------
+
+def _require_bindery(current_user: User) -> None:
+    require_role(current_user, "member")
+
+
+# ---------------------------------------------------------------------------
+# Path safety helper
+# ---------------------------------------------------------------------------
+
+def _safe_resolve(rel_path: str) -> Path:
+    """Resolve a relative path inside incoming_dir. Raises 400 on traversal."""
+    incoming = settings.incoming_dir.resolve()
+    resolved = (incoming / rel_path).resolve()
+    if not str(resolved).startswith(str(incoming)):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid path",
+        )
+    return resolved
+
+
+# ---------------------------------------------------------------------------
+# Empty-dir cleanup helper
+# ---------------------------------------------------------------------------
+
+def _cleanup_empty_dirs(start: Path) -> None:
+    """Walk upward from start, removing empty directories.
+
+    Never removes incoming_dir itself or incoming_dir/chapters/.
+    """
+    incoming = settings.incoming_dir.resolve()
+    protected = {incoming, incoming / "chapters"}
+
+    current = start.resolve()
+    while current != incoming and current != current.parent:
+        if current in protected:
+            break
+        try:
+            if current.is_dir() and not any(current.iterdir()):
+                current.rmdir()
+            else:
+                break
+        except OSError:
+            break
+        current = current.parent
+
+
+# ---------------------------------------------------------------------------
+# Pydantic schemas
+# ---------------------------------------------------------------------------
+
+class BinderyItem(BaseModel):
+    path: str
+    filename: str
+    size: int
+    modified: float
+    format: str
+    content_type: str
+    series: str | None
+    series_index: float | None
+    title: str
+    author: str | None
+    folder: str | None
+
+
+class PreviewRequest(BaseModel):
+    path: str
+    query: str | None = None  # manual search override
+
+
+class BinderyAcceptFile(BaseModel):
+    path: str
+    title: str
+    author: str | None = None
+    series: str | None = None
+    series_index: float | None = None
+    content_type: str = "volume"
+    book_type_id: int | None = None
+    description: str | None = None
+    publisher: str | None = None
+    year: int | None = None
+    isbn: str | None = None
+    language: str | None = None
+    cover_url: str | None = None
+    tags: list[str] = []
+    # Libraries to file the accepted book into, on top of the automatic
+    # book-type library (issue #103). Ids the user may not edit are skipped.
+    library_ids: list[int] = []
+
+
+class BinderyAcceptRequest(BaseModel):
+    files: list[BinderyAcceptFile]
+
+
+class RejectRequest(BaseModel):
+    paths: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/count")
+def bindery_count(
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Return the number of supported files waiting in the bindery."""
+    _require_bindery(current_user)
+
+    incoming = settings.incoming_dir
+    count = 0
+    for p in incoming.rglob("*"):
+        if p.is_file() and not any(part.startswith(".") for part in p.parts):
+            if p.suffix.lower() in SUPPORTED_EXTENSIONS:
+                count += 1
+    return {"count": count}
+
+
+def _collect_items() -> list[BinderyItem]:
+    """Walk the incoming dir into parsed BinderyItems (shared by list/groups)."""
+    incoming = settings.incoming_dir.resolve()
+    items: list[BinderyItem] = []
+
+    for p in incoming.rglob("*"):
+        if not p.is_file():
+            continue
+        # Skip hidden files and files inside hidden directories
+        rel = p.relative_to(incoming)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        if p.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            continue
+
+        rel_str = str(rel)
+        rel_parts = rel.parts
+
+        # in_chapters_dir: file path starts with "chapters/"
+        in_chapters_dir = len(rel_parts) > 1 and rel_parts[0].lower() == "chapters"
+
+        parsed = parse_filename(p.name, in_chapters_dir=in_chapters_dir)
+
+        stat = p.stat()
+
+        # folder: the immediate parent dir name if not incoming_dir root
+        folder: str | None = None
+        if len(rel_parts) > 1:
+            folder = rel_parts[-2]  # immediate parent directory name
+
+        items.append(
+            BinderyItem(
+                path=rel_str,
+                filename=p.name,
+                size=stat.st_size,
+                modified=stat.st_mtime,
+                format=p.suffix.lower().lstrip("."),
+                content_type=parsed.content_type,
+                series=parsed.series,
+                series_index=parsed.series_index,
+                title=parsed.title,
+                author=parsed.author,
+                folder=folder,
+            )
+        )
+
+    # Sort: folder (grouped, None last), then filename
+    items.sort(key=lambda i: (i.folder or "\xff", i.filename))
+    return items
+
+
+@router.get("", response_model=list[BinderyItem])
+def bindery_list(
+    current_user: User = Depends(get_current_user),
+) -> list[BinderyItem]:
+    """List all pending files in the bindery with parsed metadata."""
+    _require_bindery(current_user)
+    return _collect_items()
+
+
+@router.get("/groups")
+def bindery_groups(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """Pending files grouped by series, each group carrying a proposed identity.
+
+    The unit of review becomes the series, not the file: 12 volumes of one
+    series are one decision (name, author, type, libraries) plus per-volume
+    confirmation. When the series already exists in the library the proposal
+    adopts its canonical identity (sibling_match), so drift-named files
+    ("Frieren - Beyond Journey's End") land under the existing spelling.
+    """
+    _require_bindery(current_user)
+    import re as _re
+    from backend.services.organizer import get_library_path
+    from backend.services.sibling_match import find_series_identity
+
+    def norm(s: str) -> str:
+        return _re.sub(r"\s+", " ", _re.sub(r"[^a-z0-9]+", " ", s.lower())).strip()
+
+    items = _collect_items()
+    groups: dict[str, list[BinderyItem]] = {}
+    for it in items:
+        key = f"s:{norm(it.series)}" if it.series else (f"f:{it.folder}" if it.folder else f"p:{it.path}")
+        groups.setdefault(key, []).append(it)
+
+    out: list[dict] = []
+    for key, members in groups.items():
+        members.sort(key=lambda i: (i.series_index is None, i.series_index or 0, i.filename))
+        series_guess = next((m.series for m in members if m.series), None) \
+            or (members[0].folder if key.startswith("f:") else None)
+        author_guess = next((m.author for m in members if m.author), None)
+        identity = find_series_identity(db, series_guess, author_guess)
+
+        proposed_series = identity.series if identity else series_guess
+        proposed_author = (identity.author if identity else None) or author_guess
+        files = []
+        for m in members:
+            dest = get_library_path({
+                "title": m.title,
+                "author": proposed_author,
+                "series": proposed_series,
+                "series_index": m.series_index,
+            }, m.filename)
+            files.append({
+                "path": m.path,
+                "filename": m.filename,
+                "title": m.title,
+                "series_index": m.series_index,
+                "content_type": m.content_type,
+                "format": m.format,
+                "size": m.size,
+                "dest_preview": str(dest),
+            })
+        out.append({
+            "key": key,
+            "series": proposed_series,
+            "author": proposed_author,
+            "book_type_id": identity.book_type_id if identity else None,
+            "language": identity.language if identity else None,
+            "library_ids": identity.library_ids if identity else [],
+            "library_match": {
+                "series": identity.series,
+                "volume_count": identity.volume_count,
+                "from_reviewed": identity.from_reviewed,
+            } if identity else None,
+            "files": files,
+        })
+
+    # Real series first (largest first), then folder groups, then singletons
+    out.sort(key=lambda g: (not g["series"], -len(g["files"])))
+    return out
+
+
+@router.post("/preview")
+async def bindery_preview(
+    body: PreviewRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Fetch metadata candidates for a single bindery file without creating a Book."""
+    _require_bindery(current_user)
+
+    full_path = _safe_resolve(body.path)
+    if not full_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    meta = extract_metadata(full_path, settings.covers_dir)
+
+    # Sibling identity: if this series already exists in the library, rank
+    # candidates with the canonical series/author/type as context and tell the
+    # UI what it matched so review can adopt the existing settings in one click.
+    from backend.services.filename_parser import parse_filename
+    from backend.services.sibling_match import find_series_identity
+    parsed = parse_filename(full_path.name)
+    identity = find_series_identity(
+        db, meta.get("series") or parsed.series,
+        meta.get("author") or parsed.author)
+    media_hint = None
+    if identity and identity.book_type_id:
+        from backend.models.library import BookType
+        bt = db.get(BookType, identity.book_type_id)
+        media_hint = bt.slug if bt else None
+
+    fetch_result = await fetch_candidates(
+        title=meta.get("title") or full_path.stem,
+        author=(identity.author if identity else None) or meta.get("author"),
+        isbn=meta.get("isbn"),
+        series=(identity.series if identity else None) or meta.get("series"),
+        series_index=meta.get("series_index"),
+        query_override=body.query,
+        language=(identity.language if identity else None) or meta.get("language"),
+        media_hint=media_hint,
+    )
+
+    # Serialise MetadataCandidate dataclasses to dicts
+    candidates = [
+        {
+            "source": c.source,
+            "source_id": c.source_id,
+            "title": c.title,
+            "author": c.author,
+            "description": c.description,
+            "cover_url": c.cover_url,
+            "publisher": c.publisher,
+            "year": c.year,
+            "page_count": c.page_count,
+            "isbn": c.isbn,
+            "language": c.language,
+            "tags": c.tags,
+            "series": c.series,
+            "series_index": c.series_index,
+        }
+        for c in fetch_result.candidates
+    ]
+
+    # Strip internal private keys from file_metadata before returning
+    file_metadata = {k: v for k, v in meta.items() if not k.startswith("_")}
+
+    return {
+        "file_metadata": file_metadata,
+        "candidates": candidates,
+        "query_used": fetch_result.query_used,
+        "sources": fetch_result.sources,
+        # The adopt-existing-series shortcut in the review UI hangs off this.
+        "library_match": {
+            "series": identity.series,
+            "author": identity.author,
+            "book_type_id": identity.book_type_id,
+            "language": identity.language,
+            "library_ids": identity.library_ids,
+            "volume_count": identity.volume_count,
+            "from_reviewed": identity.from_reviewed,
+        } if identity else None,
+    }
+
+
+@router.post("/accept")
+def bindery_accept(
+    body: BinderyAcceptRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Accept files from the bindery into the library."""
+    _require_bindery(current_user)
+
+    accepted: list[dict] = []
+    errors: list[dict] = []
+
+    for item in body.files:
+        try:
+            full_path = _safe_resolve(item.path)
+            if not full_path.exists():
+                errors.append({"path": item.path, "error": "File not found"})
+                continue
+
+            suffix = full_path.suffix.lower().lstrip(".")
+            content_hash = sha256_file(full_path)
+            file_size = full_path.stat().st_size
+
+            # Extract metadata for cover even if user has provided all other fields
+            meta = extract_metadata(full_path, settings.covers_dir)
+
+            # Build meta dict for library path calculation from provided fields
+            path_meta: dict = {
+                "title": item.title,
+                "author": item.author,
+                "series": item.series,
+                "series_index": item.series_index,
+                "year": item.year,
+            }
+
+            # Determine destination path
+            rel = get_library_path(path_meta, full_path.name)
+            dest = resolve_unique_path(settings.library_dir, rel)
+
+            # Move the file (cleans up a half-finished cross-device copy on failure)
+            move_into_library(full_path, dest)
+
+            # Determine cover: use extracted cover or download from cover_url
+            cover_path: str | None = meta.get("cover_path")
+            if item.cover_url:
+                try:
+                    import asyncio as _asyncio
+                    cover_data = _asyncio.run(fetch_safe_image(item.cover_url))
+                    from backend.services.metadata import save_cover
+                    cover_path = save_cover(cover_data, settings.covers_dir, content_hash)
+                except (UnsafeURLError, Exception) as exc:
+                    logger.warning("Failed to download cover from %s: %s", item.cover_url, exc)
+
+            # Create Book record
+            book = Book(
+                title=item.title,
+                author=item.author,
+                series=item.series,
+                series_index=item.series_index,
+                isbn=item.isbn,
+                publisher=item.publisher,
+                description=item.description,
+                language=item.language,
+                year=item.year,
+                cover_path=cover_path,
+                content_hash=content_hash,
+                content_type=item.content_type,
+                status="active",
+                # Accepting IS the review — without this the book landed in the
+                # unreviewed queue and didn't count as authoritative for
+                # sibling-identity matching (pre-existing bug).
+                is_reviewed=True,
+                added_by=current_user.id,
+                book_type_id=item.book_type_id,
+            )
+            db.add(book)
+            db.flush()
+
+            # Create BookFile record
+            db.add(BookFile(
+                book_id=book.id,
+                file_path=str(dest.resolve()),
+                format=suffix,
+                file_size=dest.stat().st_size,
+                content_hash=content_hash,
+            ))
+            record_ko_hash(db, book.id, ko_partial_md5(dest), "raw")
+
+            # Word count + chapter map (EPUB only) — parsed from the accepted
+            # file on disk. Fixed-layout formats get an intrinsic page count.
+            if suffix == "epub":
+                from backend.services.metadata import count_words_epub, extract_chapters_epub
+                from backend.services.chapters import replace_book_chapters
+                book.word_count = count_words_epub(dest)
+                replace_book_chapters(db, book.id, extract_chapters_epub(dest))
+            elif suffix in ("pdf", "cbz", "cbr"):
+                book.page_count = meta.get("page_count")
+
+            # Create tag records
+            for tag_str in item.tags:
+                tag_str = tag_str.strip()
+                if tag_str:
+                    db.add(BookTag(book_id=book.id, tag=tag_str, source="bindery"))
+
+            db.commit()
+
+            # Assign to book type library
+            if item.book_type_id:
+                from backend.models.library import BookType
+                bt = db.get(BookType, item.book_type_id)
+                if bt:
+                    assign_book_to_type_library(db, book, bt)
+
+            # File into explicitly chosen libraries — same permission rule as
+            # the libraries API (global = admin-only, personal = owner/admin).
+            # Unknown or unpermitted ids are skipped, never fatal to the accept.
+            if item.library_ids:
+                from backend.models.library import Library
+                for lid in item.library_ids:
+                    lib = db.get(Library, lid)
+                    if not lib:
+                        continue
+                    if lib.owner_id is None:
+                        if not is_admin(current_user):
+                            continue
+                    elif lib.owner_id != current_user.id and not is_admin(current_user):
+                        continue
+                    if lib not in book.libraries:
+                        book.libraries.append(lib)
+                db.commit()
+
+            db.refresh(book)
+
+            # Wishlist matcher — flag open wishes for admin review (no auto-fulfil)
+            from backend.services.wish_matcher import match_on_book_created
+            match_on_book_created(db, book)
+
+            # Audit
+            audit(
+                db,
+                "bindery.accepted",
+                user_id=current_user.id,
+                username=current_user.username,
+                resource_type="book",
+                resource_id=book.id,
+                resource_title=book.title,
+                details={"format": suffix, "source_path": item.path},
+            )
+
+            # Clean up empty directories left behind in bindery
+            _cleanup_empty_dirs(full_path.parent)
+
+            accepted.append({"book_id": book.id, "title": book.title})
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("Failed to accept bindery file %s", item.path)
+            db.rollback()
+            errors.append({"path": item.path, "error": str(exc)})
+
+    return {"accepted": accepted, "errors": errors}
+
+
+@router.post("/reject")
+def bindery_reject(
+    body: RejectRequest,
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Delete files from the bindery without importing them."""
+    _require_bindery(current_user)
+
+    rejected = 0
+    errors: list[dict] = []
+
+    for rel_path in body.paths:
+        try:
+            full_path = _safe_resolve(rel_path)
+            if not full_path.exists():
+                errors.append({"path": rel_path, "error": "File not found"})
+                continue
+
+            parent = full_path.parent
+            full_path.unlink()
+            rejected += 1
+
+            # Clean up empty parent directories
+            _cleanup_empty_dirs(parent)
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("Failed to reject bindery file %s", rel_path)
+            errors.append({"path": rel_path, "error": str(exc)})
+
+    return {"rejected": rejected, "errors": errors}
+
+
+# ---------------------------------------------------------------------------
+# Unreviewed books (auto-import inbox)
+# NOTE: These routes must appear before any `{path}` catch-all routes.
+# ---------------------------------------------------------------------------
+
+@router.get("/unreviewed")
+def list_unreviewed(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[dict]:
+    """Return all books that were auto-imported and have not yet been reviewed."""
+    _require_bindery(current_user)
+    books = (
+        db.query(Book)
+        .filter(Book.is_reviewed == False)  # noqa: E712
+        .order_by(Book.added_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": b.id,
+            "title": b.title,
+            "author": b.author,
+            "series": b.series,
+            "series_index": b.series_index,
+            "cover_path": b.cover_path,
+            "added_at": b.added_at.isoformat() if b.added_at else None,
+            "format": b.files[0].format if b.files else None,
+        }
+        for b in books
+    ]
+
+
+@router.put("/review-all")
+def mark_all_reviewed(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Mark all unreviewed auto-imported books as reviewed."""
+    _require_bindery(current_user)
+    updated = (
+        db.query(Book)
+        .filter(Book.is_reviewed == False)  # noqa: E712
+        .update({"is_reviewed": True})
+    )
+    db.commit()
+    return {"ok": True, "updated": updated}
+
+
+@router.put("/review/{book_id}")
+def mark_reviewed(
+    book_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Mark a single auto-imported book as reviewed."""
+    _require_bindery(current_user)
+    book = db.get(Book, book_id)
+    if not book:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Book not found")
+    book.is_reviewed = True
+    db.commit()
+    return {"ok": True}
+
+
+@router.delete("/reject/{book_id}")
+def reject_book(
+    book_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Reject an auto-imported book: delete its files from disk and remove it from the DB."""
+    _require_bindery(current_user)
+    book = db.get(Book, book_id)
+    if not book:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Book not found")
+
+    # Delete files from disk
+    for f in book.files:
+        try:
+            os.remove(f.file_path)
+        except OSError as exc:
+            logger.warning("Could not remove file %s: %s", f.file_path, exc)
+
+    # Delete cover from disk — cover_path is a relative filename inside covers_dir
+    if book.cover_path:
+        cover_full = settings.covers_dir / book.cover_path
+        try:
+            cover_full.unlink()
+        except OSError:
+            pass
+
+    db.delete(book)
+    db.commit()
+    return {"ok": True}

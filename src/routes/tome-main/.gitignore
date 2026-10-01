@@ -1,0 +1,64 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Data (never commit your library or DB)
+data/
+# …but the website's committed data dir (benchmark report snapshots) is not runtime data.
+!website/src/data/
+books/
+bindery/
+# Top-level ebook library only — docs/seed/library/ is the showcase seed and IS committed.
+/library/
+incoming/
+*.db
+*.db-wal
+*.db-shm
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Env
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Claude Code
+.claude/
+
+# Scribe
+.scribe-state.json
+
+# Docker — docker-compose.yml is the canonical portable one (tracked).
+# Use docker-compose.override.yml for any local-only customisations
+# (it's auto-merged by docker compose).
+docker-compose.override.yml
+
+# Local dev docs and scratch files
+CLAUDE.md
+AGENTS.md
+PLAN.md
+local/
+temp/
+docs/transfer.md
+docs/plans/
+scripts/tome_transfer.py
+graphify-out/
+
+# Local-only personal data: copied KOReader stats + prod DB for stats-expansion work (never commit)
+.statsdb/

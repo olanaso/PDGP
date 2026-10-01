@@ -60,6 +60,7 @@ import { Route as ProyectosProjectIdEvaluacionInformacionRouteImport } from './r
 import { Route as ProyectosProjectIdEquiposRouteImport } from './routes/proyectos.$projectId.equipos'
 import { Route as ProyectosProjectIdCodigosPrediosRouteImport } from './routes/proyectos.$projectId.codigos-predios'
 import { Route as ProyectosProjectIdCodigosPlanosRouteImport } from './routes/proyectos.$projectId.codigos-planos'
+import { Route as ProyectosProjectIdBimRouteImport } from './routes/proyectos.$projectId.bim'
 import { Route as ProyectosProjectIdBaseGraficaRouteImport } from './routes/proyectos.$projectId.base-grafica'
 import { Route as ProyectosProjectIdBaseGraficaIndexRouteImport } from './routes/proyectos.$projectId.base-grafica.index'
 import { Route as SeguridadRolesRoleIdPermisosRouteImport } from './routes/seguridad.roles.$roleId.permisos'
@@ -386,6 +387,11 @@ const ProyectosProjectIdCodigosPlanosRoute =
     path: '/proyectos/$projectId/codigos-planos',
     getParentRoute: () => rootRouteImport,
   } as any)
+const ProyectosProjectIdBimRoute = ProyectosProjectIdBimRouteImport.update({
+  id: '/proyectos/$projectId/bim',
+  path: '/proyectos/$projectId/bim',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ProyectosProjectIdBaseGraficaRoute =
   ProyectosProjectIdBaseGraficaRouteImport.update({
     id: '/proyectos/$projectId/base-grafica',
@@ -705,6 +711,7 @@ export interface FileRoutesByFullPath {
   '/proyectos/': typeof ProyectosIndexRoute
   '/seguimiento-monitoreo/': typeof SeguimientoMonitoreoIndexRoute
   '/proyectos/$projectId/base-grafica': typeof ProyectosProjectIdBaseGraficaRouteWithChildren
+  '/proyectos/$projectId/bim': typeof ProyectosProjectIdBimRoute
   '/proyectos/$projectId/codigos-planos': typeof ProyectosProjectIdCodigosPlanosRoute
   '/proyectos/$projectId/codigos-predios': typeof ProyectosProjectIdCodigosPrediosRoute
   '/proyectos/$projectId/equipos': typeof ProyectosProjectIdEquiposRoute
@@ -798,6 +805,7 @@ export interface FileRoutesByTo {
   '/seguridad/usuarios': typeof SeguridadUsuariosRoute
   '/proyectos': typeof ProyectosIndexRoute
   '/seguimiento-monitoreo': typeof SeguimientoMonitoreoIndexRoute
+  '/proyectos/$projectId/bim': typeof ProyectosProjectIdBimRoute
   '/proyectos/$projectId/codigos-planos': typeof ProyectosProjectIdCodigosPlanosRoute
   '/proyectos/$projectId/codigos-predios': typeof ProyectosProjectIdCodigosPrediosRoute
   '/proyectos/$projectId/equipos': typeof ProyectosProjectIdEquiposRoute
@@ -895,6 +903,7 @@ export interface FileRoutesById {
   '/proyectos/': typeof ProyectosIndexRoute
   '/seguimiento-monitoreo/': typeof SeguimientoMonitoreoIndexRoute
   '/proyectos/$projectId/base-grafica': typeof ProyectosProjectIdBaseGraficaRouteWithChildren
+  '/proyectos/$projectId/bim': typeof ProyectosProjectIdBimRoute
   '/proyectos/$projectId/codigos-planos': typeof ProyectosProjectIdCodigosPlanosRoute
   '/proyectos/$projectId/codigos-predios': typeof ProyectosProjectIdCodigosPrediosRoute
   '/proyectos/$projectId/equipos': typeof ProyectosProjectIdEquiposRoute
@@ -993,6 +1002,7 @@ export interface FileRouteTypes {
     | '/proyectos/'
     | '/seguimiento-monitoreo/'
     | '/proyectos/$projectId/base-grafica'
+    | '/proyectos/$projectId/bim'
     | '/proyectos/$projectId/codigos-planos'
     | '/proyectos/$projectId/codigos-predios'
     | '/proyectos/$projectId/equipos'
@@ -1086,6 +1096,7 @@ export interface FileRouteTypes {
     | '/seguridad/usuarios'
     | '/proyectos'
     | '/seguimiento-monitoreo'
+    | '/proyectos/$projectId/bim'
     | '/proyectos/$projectId/codigos-planos'
     | '/proyectos/$projectId/codigos-predios'
     | '/proyectos/$projectId/equipos'
@@ -1182,6 +1193,7 @@ export interface FileRouteTypes {
     | '/proyectos/'
     | '/seguimiento-monitoreo/'
     | '/proyectos/$projectId/base-grafica'
+    | '/proyectos/$projectId/bim'
     | '/proyectos/$projectId/codigos-planos'
     | '/proyectos/$projectId/codigos-predios'
     | '/proyectos/$projectId/equipos'
@@ -1260,6 +1272,7 @@ export interface RootRouteChildren {
   SeguridadUsuariosRoute: typeof SeguridadUsuariosRoute
   ProyectosIndexRoute: typeof ProyectosIndexRoute
   ProyectosProjectIdBaseGraficaRoute: typeof ProyectosProjectIdBaseGraficaRouteWithChildren
+  ProyectosProjectIdBimRoute: typeof ProyectosProjectIdBimRoute
   ProyectosProjectIdCodigosPlanosRoute: typeof ProyectosProjectIdCodigosPlanosRoute
   ProyectosProjectIdCodigosPrediosRoute: typeof ProyectosProjectIdCodigosPrediosRoute
   ProyectosProjectIdEquiposRoute: typeof ProyectosProjectIdEquiposRoute
@@ -1666,6 +1679,13 @@ declare module '@tanstack/react-router' {
       path: '/proyectos/$projectId/codigos-planos'
       fullPath: '/proyectos/$projectId/codigos-planos'
       preLoaderRoute: typeof ProyectosProjectIdCodigosPlanosRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/proyectos/$projectId/bim': {
+      id: '/proyectos/$projectId/bim'
+      path: '/proyectos/$projectId/bim'
+      fullPath: '/proyectos/$projectId/bim'
+      preLoaderRoute: typeof ProyectosProjectIdBimRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/proyectos/$projectId/base-grafica': {
@@ -2093,6 +2113,7 @@ const rootRouteChildren: RootRouteChildren = {
   ProyectosIndexRoute: ProyectosIndexRoute,
   ProyectosProjectIdBaseGraficaRoute:
     ProyectosProjectIdBaseGraficaRouteWithChildren,
+  ProyectosProjectIdBimRoute: ProyectosProjectIdBimRoute,
   ProyectosProjectIdCodigosPlanosRoute: ProyectosProjectIdCodigosPlanosRoute,
   ProyectosProjectIdCodigosPrediosRoute: ProyectosProjectIdCodigosPrediosRoute,
   ProyectosProjectIdEquiposRoute: ProyectosProjectIdEquiposRoute,

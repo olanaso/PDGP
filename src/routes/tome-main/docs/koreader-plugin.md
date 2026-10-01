@@ -1,0 +1,490 @@
+# TomeSync KOReader Plugin
+
+Syncs reading progress and sessions between KOReader and your Tome library.
+
+---
+
+## Setup
+
+**KOReader version.** Use the current KOReader release; the plugin is developed and tested against the latest stable (v2025.08 at the time of writing) and self-updates alongside Tome. Minimum for all features is **v2024.07** (highlights sync uses KOReader's annotations API). Older releases still load the plugin, but features that need a newer API are disabled: metadata sync needs v2023.10 or newer, and the file browser refreshes ratings only after a restart before v2025.04.
+
+1. Open Tome in your browser at `http://<your-server>:<port>/settings`
+2. Scroll to the **KOReader** section
+3. Click **Download Plugin**
+4. Extract the ZIP to `koreader/plugins/` on your device so you have `koreader/plugins/tomesync.koplugin/main.lua`
+5. Restart KOReader
+
+The plugin is pre-configured with your server URL and API key. No manual configuration needed. If the server address ever changes later, it can be edited on the device — see [Moving servers & switching accounts](#moving-servers--switching-accounts).
+
+**Important:** Download the plugin from the same address your e-reader can reach. If your server is at `<your-server-ip>:8080`, open the settings page at that address before downloading.
+
+---
+
+## Features
+
+- **Reading sync** -- position, progress, and reading sessions sync between KOReader and Tome's web reader
+- **Rating sync** -- KOReader's native star rating and review sync both ways with Tome
+- **Metadata sync** -- Tome's title, author, series, tags, description and cover are written into KOReader's custom metadata for the books on your device (opt-in; the book files are never modified)
+- **Reading-history import** -- backfill Tome's Stats with KOReader's own per-page reading history from before TomeSync (reading time and pages only -- never your read/unread status)
+- **Series browser** -- browse your library's series and download entire series to your device in one tap
+- **Offline-safe** -- everything works seamlessly when your server is unreachable; sessions queue and flush later
+- **Context-aware menu** -- different options when a book is open vs. from the home screen
+
+---
+
+## How It Works
+
+### Book Matching
+
+When you open a book, the plugin tries to match the file to a book in your Tome library:
+
+1. Checks its local cache for a known mapping
+2. If not cached, sends the filename to `GET /api/tome-sync/resolve?filename=<name>`
+3. The server matches by file path, title, and volume number (e.g. `Vol. 1` in the filename matches `series_index = 1`)
+4. Once resolved, the mapping is cached locally so future opens are instant
+
+Books downloaded via OPDS are matched automatically. Books sideloaded from other sources will also match as long as the filename contains the book title.
+
+If no match is found, the plugin silently skips sync for that book.
+
+### When It Syncs
+
+| Event | What happens |
+|---|---|
+| **Open a book** | Pulls latest position from server. If the server is ahead, jumps to that position. Also reconciles the book's rating with Tome. |
+| **Every 50 page turns** | Pushes current position to server (heartbeat). |
+| **Close the lid (suspend)** | Pushes position, records a reading session, and pushes a rating you set this session. |
+| **Open the lid (resume)** | Starts a new session, pushes position, and flushes any pending offline sessions. |
+| **Close a book** | Pushes final position, records a reading session, and pushes a rating you set this session. |
+| **"Sync now" in menu** | Manual push of current position and flushes pending offline sessions. |
+
+### Web Reader → KOReader Sync
+
+Progress saved in Tome's built-in web reader is written to `TomeSyncPosition` on the server. When you next open the same book in KOReader, the plugin detects the server is ahead and jumps to the position you left off at in the browser. This makes the web reader and KOReader fully bidirectional — you can switch between them without losing your place.
+
+### Reading Sessions
+
+Every time you close the lid or close a book, the plugin records a session with:
+
+- Start and end timestamps
+- Duration in seconds
+- Progress at start and end (percentage)
+- Number of page turns
+- Device name
+
+Sessions shorter than 10 seconds are filtered out. Each session has a unique ID to prevent duplicates.
+
+These sessions power the **Stats** page in Tome, showing reading time, streaks, and charts.
+
+### Reading-History Import
+
+KOReader keeps its own per-page reading log in `statistics.sqlite3` — often going back
+years, long before you installed TomeSync. The plugin can import that log into Tome so
+your **Stats** page reflects reading from before TomeSync existed.
+
+- Enable **TomeSync > Auto-sync reading history on launch**, or run it once from
+  **TomeSync > Sync reading history** (also assignable to a gesture).
+- The first sync pushes your **entire** history; it is **chunked and resumable** — the
+  server tracks a per-device watermark and ignores duplicates, so it survives the device
+  sleeping or Wi-Fi dropping mid-sync. Later syncs send only new reading.
+- It imports **reading time and pages only** — it never changes your read/unread status.
+  That stays yours to set (only the live progress sync above moves status).
+- Books are matched to your library by title/series/volume; anything the matcher can't
+  place confidently is left out rather than guessed at, so nothing wrong appears in your
+  stats. Multiple devices each sync their own history without double-counting the same
+  reading.
+
+### Reading Status
+
+The server automatically updates the book's reading status based on progress:
+
+- **unread** to **reading** when progress > 0%
+- **reading** to **read** when progress >= 99%
+
+### Series Download
+
+The plugin can browse and download entire series directly to your device.
+
+**From the home screen (no book open):**
+
+1. Open the wrench menu, find **TomeSync > Browse series**
+2. A list shows all series in your Tome library with book counts and authors
+3. Tap a series to download all books in it
+
+**From inside a book:**
+
+- **Download full series** -- downloads every book in the current book's series
+- **Download rest of series** -- downloads only books after your current volume (based on series_index)
+
+**How downloads work:**
+
+- Books are organized by book type and series: `<home_dir>/<book_type>/<Series Name>/` (e.g. `books/manga/One Piece/`, `books/light_novel/Black Summoner/`). The base directory is KOReader's home folder if set, falling back to `download_dir` then `lastdir`.
+- The book type (manga, light_novel, book, comic) comes from Tome's metadata
+- Filenames mirror Tome's OPDS naming: `Vol. N — Title.ext` for volumes in a series, plain `Title.ext` otherwise. This keeps light-novel volumes that share a title from clobbering each other.
+- Format preference: epub > kepub.epub > cbz > pdf > mobi > azw3
+- Books already on the device are skipped (matched by book ID, not filename)
+- A live progress popup shows "Downloading N of M — Title" as each book is fetched
+- Downloaded books are automatically registered in the book map, so sync works immediately when you open them
+- A summary shows downloaded/skipped/failed counts when finished
+
+### Download location & naming
+
+By default downloads are filed as described above (`<book_type>/<Series Name>/Vol. N — Title.ext`, standalones under their author). **Settings → Download location & naming** changes this. The setting applies to *every* way books reach the device — the series browser, the in-book series downloads, and the Send-to-KOReader inbox all share one downloader. It is per-device and stored in KOReader's own settings, so your phone can use a different layout than your e-reader, and it survives plugin updates.
+
+Three options:
+
+- **Default (type and series folders)** — the layout above. This is also what runs when no template is set, on exactly the same code path as before the setting existed.
+- **Flat in home folder** — every book lands directly in the home folder, named `Series - NN - Title.ext`. Series and volume are dropped for books that have none, so a standalone is just `Title.ext`. For people who keep everything unsorted in one place.
+- **Custom template** — build the path yourself, Sonarr/Radarr-style.
+
+#### Custom templates
+
+A template is a **free-form string**: tokens, literal text, and `/` folder separators in any combination. The dialog pre-fills a suggestion (`{book_type}/{series}/{volume:00} - {title}`) purely as a starting point — delete it and write anything. Tokens can repeat, literals can appear anywhere, folders can nest as deep as you like.
+
+**Token reference** (the complete set — anything else is rejected):
+
+| Token | Renders as | Empty when |
+|---|---|---|
+| `{book_type}` | Tome book-type slug (`manga`, `light_novel`, `novel`, ...) | never (falls back to `book`) |
+| `{series}` | series name | book has no series |
+| `{volume}` | series index as-is (`3`, `12`, `1.5`) | book has no series index |
+| `{volume:00}` | zero-padded series index (`03`); pad width = number of zeros, so `{volume:000}` gives `003`. Fractional volumes (`1.5`) are never padded. | book has no series index |
+| `{title}` | book title | never |
+| `{author}` | author name | author unknown |
+
+**Case modifiers:** wrap a token *name* in `Lower(...)` or `Upper(...)` — `{Lower(series)}`, `{Upper(book_type)}`. No inner braces: `{Lower({series})}` is not valid syntax.
+
+**Rules:**
+
+- `/` starts a new folder. Everything between slashes becomes one folder (or, for the last part, the filename).
+- The file extension (`.epub`, `.cbz`, ...) is **appended automatically** — never write it in the template.
+- Anything that isn't a token is literal text and is kept verbatim.
+
+**Examples** (Berserk vol. 3, "The Egg of the King", Kentaro Miura, type `manga`):
+
+| Template | Result |
+|---|---|
+| `{title}` | `The Egg of the King.epub` |
+| `{series} - {volume:00} - {title}` | `Berserk - 03 - The Egg of the King.epub` (this is the flat preset) |
+| `Tome/{series}/{title}` | `Tome/Berserk/The Egg of the King.epub` — literal folder name |
+| `{author}/{series} {volume:000} {title}` | `Kentaro Miura/Berserk 003 The Egg of the King.epub` |
+| `{Upper(series)}/vol{volume} - {Lower(title)}` | `BERSERK/vol3 - the egg of the king.epub` |
+| `{book_type}/{series}/{series} v{volume}` | `manga/Berserk/Berserk v3.epub` — tokens may repeat |
+
+**Books without a series (or volume, or author):** empty tokens disappear, *together with orphaned separators around them* — spaces, `-`, `_` and `,` left dangling by a vanished token are tidied up, and a folder segment that renders entirely empty is dropped. So one template serves series books and standalones:
+
+| Template | Series book | Standalone |
+|---|---|---|
+| `{series} - {volume:00} - {title}` | `Berserk - 03 - The Egg of the King.epub` | `Frankenstein.epub` |
+| `{book_type}/{series}/{volume:00} - {title}` | `manga/Berserk/03 - The Egg of the King.epub` | `novel/Frankenstein.epub` (series folder dropped) |
+
+One caveat: the cleanup removes orphaned *separators*, not orphaned *words*. A literal glued to a token — `Vol. {volume}` — leaves `Vol` behind when the book has no volume (`Vol - Title.epub`). If your library mixes series books and standalones, keep bare separators around tokens that can be empty (`{volume:00} - {title}`), the way both presets do. There is no conditional syntax ("include this text only when the token exists") — if you need that, open an issue.
+
+**Validation and safety:**
+
+- Templates are validated when you tap **Save**: an unknown token (or a template that renders to nothing) is rejected on the spot with an error, and a valid template shows a preview of the resulting filename. A typo can't silently misfile your downloads.
+- Every path segment is sanitized for the filesystem, and `..` segments are discarded — a template can never place files outside the download base folder.
+- A `/` *inside* a metadata value (a title like `Fate/Zero`) becomes `-`; only slashes you write in the template create folders.
+- If a saved template somehow renders empty for a particular book (e.g. it only uses `{series}` and the book has none), that book falls back to the default layout rather than failing.
+- Leave the dialog's input empty and save to clear the template and restore the default layout.
+
+**Changing the setting later** only affects *future* downloads: books already on the device are remembered by book ID and stay skipped regardless of where they live, and previously downloaded files are not moved.
+
+---
+
+## Offline and Unreachable Server
+
+The plugin is designed to work seamlessly when your server is not reachable -- whether you are on a plane, commuting without VPN access, or your server is simply down.
+
+### What happens when you are offline
+
+- **No WiFi at all:** Every sync request is skipped instantly. There is zero delay or freezing. You will not notice anything different while reading.
+- **WiFi connected but server unreachable** (e.g. public WiFi without VPN): Requests time out after 5 seconds. After 3 consecutive failures, the plugin stops trying for the rest of the session. No further delays.
+- **Reading sessions are saved locally:** If a session cannot be sent to the server (because you are offline when you close the lid), it is saved to disk and retried automatically the next time you open the lid with a working connection.
+
+### Typical commute flow
+
+1. You start reading on the train (no server access)
+2. All sync silently skips -- reading is completely uninterrupted
+3. You close the lid -- the session is saved locally on your device
+4. You get home, open a book -- within the first 50 page turns, the plugin flushes all saved sessions to the server
+5. Your Stats page and reading progress are up to date
+
+Sessions also flush when you tap "Sync now" in the menu, or when WiFi reconnects and you resume reading.
+
+### Limits
+
+- Up to 50 sessions can be saved locally. If you go offline for an extremely long time, the oldest sessions are dropped to prevent unbounded storage use.
+- Sessions saved locally survive KOReader restarts -- they are stored in KOReader's settings file.
+- The backoff counter (3 failures before giving up) resets automatically on the next successful request. You can also reset it manually via **Settings → Test connection** in the plugin menu.
+
+---
+
+## Menu
+
+The plugin menu is context-aware. It self-registers in the **wrench menu** (after Calibre) under **TomeSync** and shows different options depending on whether a book is open.
+
+### Always visible
+
+| Option | Description |
+|---|---|
+| **Browse series** | Opens the series browser. Lists all series with book count and author. Tap to download. |
+| **Sync reading history** | Imports KOReader's per-page reading log into Tome's Stats (time and pages only). First run backfills everything; chunked and resumable. See [Reading-History Import](#reading-history-import). |
+| **Sync closed books** | Library sweep: adopts status, rating and progress from books on the device TomeSync has never synced (read before Tome, sideloaded). Only fills what Tome doesn't already have. |
+| **Apply Tome metadata now** | Writes Tome's title, author, series, tags, description and cover for the books on this device into KOReader's custom metadata, then shows a summary. Runs regardless of the automatic setting. See [Metadata sync](#metadata-sync-tome---koreader). |
+| **Settings** | Submenu with persistent options and diagnostics (see below). |
+| **About** | Version info (semver + build). |
+
+### Only when a book is open
+
+| Option | Description |
+|---|---|
+| **Download full series** | Downloads all books in the current book's series. |
+| **Download rest of series** | Downloads books after the current volume only. |
+| **Sync now** | Pushes current position, highlights/notes, and flushes any pending offline sessions. |
+| **Tracking: on / paused** | Pauses automatic session tracking and syncing for the current KOReader run. Resets to on at the next start — it is not a permanent setting. Manual actions (Sync now, downloads) still work while paused. |
+| **Pending sessions (N)** | Shows how many sessions are queued for sync. Tap for details. |
+
+### Settings submenu
+
+| Option | Description |
+|---|---|
+| **Auto-connect WiFi when needed** | Opt-in toggle, off by default. When a TomeSync action needs the server and WiFi is down, KOReader re-establishes the connection first (honouring your KOReader WiFi prompt/auto-enable setting), then runs the action. Helps devices that aggressively sleep WiFi, e.g. PocketBook. Only user-initiated actions reconnect — background tracking never turns the radio on. |
+| **Download location & naming** | Where downloads (series, inbox) are filed: the default type/series layout, flat in the home folder, or a custom token template. Per-device. See [Download location & naming](#download-location--naming). |
+| **Test connection** | Verifies the server is reachable. Also resets the backoff counter if the server was previously unreachable. |
+| **Re-resolve all books** | Wipes the local filename-to-book-ID cache. Use if a book matched incorrectly. |
+| **Check for updates** | Fetches the latest plugin build from your server and installs it if newer (then prompts to restart). |
+| **Auto-check for updates on launch** | Opt-in toggle. When on, TomeSync checks for updates shortly after startup and prompts only when one is available. |
+| **Auto-sync reading history on launch** | Opt-in toggle, off by default. When on, TomeSync pushes new KOReader reading history to Tome shortly after startup (the first run backfills your whole history; chunked and resumable). Reading time and pages only — never your read/unread status. See [Reading-History Import](#reading-history-import). |
+| **Sync on suspend** | Opt-in toggle. When the device goes to sleep, catches up anything still pending (sessions, ratings, reading history if enabled) so your stats are current without waking the device. Only syncs when WiFi is already connected. |
+| **Apply Tome metadata to this device** | Opt-in toggle, off by default. Keeps the metadata KOReader shows for Tome books in step with the Tome library via KOReader's custom metadata (the book files are never modified). Tome is the source of truth: metadata edited on the device is overridden. Runs after launch and when WiFi connects. See [Metadata sync](#metadata-sync-tome---koreader). |
+| **Aggressive sync (turn WiFi on at suspend)** | Opt-in, requires Sync on suspend. Turns WiFi on at suspend to sync, then lets the device power it back down. Uses more battery. |
+| **Idle time cap** | Longest gap between page turns that still counts as reading (default 10 minutes). Time beyond the cap — you fell asleep, the cover did not sleep the device — is not booked to the session. |
+| **Device name** | The label Tome shows for this device in the reading log and stats. Defaults to the device model; set a name if you use several devices of the same kind. |
+| **Server URL** | The Tome server this device talks to. Baked in at download time; edit it here if the server has moved (marked "(custom)" when overridden). Clear the field to restore the baked-in default. See [Moving servers & switching accounts](#moving-servers--switching-accounts). |
+| **Account** | The Tome account this device syncs as. Display-only — it is decided by the API key, so switching accounts goes through **Sign in with code**. |
+| **Sign in with code** | Connects the device to a Tome account without typing any credentials: the plugin shows a short code, you enter it in the Tome web UI (Settings → Security → Quick Connect), and the device receives its own API key. |
+| **Reset connection to baked-in defaults** | Forgets the server URL, API key and account set on the device and returns to what the plugin download baked in. Only enabled when something is overridden. |
+
+### Gestures
+
+TomeSync registers bindable gesture actions (KOReader **Settings → Taps and gestures → Gesture manager**, listed under *General* — available in both the reader and the file manager):
+
+| Action | Does |
+|---|---|
+| **TomeSync: Open menu** | Pops the full context-aware TomeSync menu as a standalone popup. |
+| **TomeSync: Browse series** | Jumps straight to the series browser/downloader. |
+| **TomeSync: Sync highlights** | Pushes the current book's highlights and notes to Tome immediately. |
+| **TomeSync: Sync reading history** | Imports KOReader's per-page reading history into Tome's Stats (time and pages only). |
+
+---
+
+## Highlights & notes sync
+
+Highlights and notes you make in KOReader sync to Tome — and **to your other
+KOReader devices**. They also appear in a **Highlights & Notes** section on the
+book's detail page (the highlighted text, your note, and the chapter). Sync happens
+automatically alongside position sync — when you open a book (pulls others'
+highlights), on suspend, on closing the book, and via **Sync now** — and can be
+triggered manually with the **TomeSync: Sync highlights** gesture.
+
+**How conflicts resolve.** Identity is the highlight's position, so the same
+passage highlighted on two devices is one highlight. Edits to the same highlight's
+note resolve last-write-wins (newest edit). Deletes propagate via tombstones — a
+highlight you remove on one device is removed on the others and won't reappear.
+Device→device sync needs both devices to have the **Tome-served copy** of the book
+(identical file → matching positions); a sideloaded different copy won't line up.
+
+Rendering highlights *inside the web reader* is a separate, later step — for now
+the web side shows them as a list on the detail page.
+
+---
+
+## Metadata sync (Tome -> KOReader)
+
+Opt-in, off by default: **Settings > Apply Tome metadata to this device**.
+
+When it is on, the plugin keeps the metadata KOReader shows for the books on
+your device in step with your Tome library: title, author, series and series
+index, language, tags (as keywords), description and cover. Tome is the
+source of truth - if you edit a field in Tome, the device follows on its next
+sync, and a field you edit or reset on the device is put back to Tome's
+value.
+
+**What it writes.** KOReader has its own override layer for book metadata: the
+`custom_metadata.lua` file and custom cover in the book's `.sdr` folder, the
+same thing Book information > Edit fills in when you correct a title by hand.
+The plugin writes exactly that. The book file itself is never modified, so
+its identity (the hash Tome and KOReader match on), your reading position,
+highlights and every other sidecar setting stay untouched. KOReader's own
+"reset" on a field still restores the file's embedded value, and deleting the
+sidecar file puts everything back the way the file came.
+
+**What it does not do.** It does not rename files on the device: a book
+downloaded as `Vol. 1 — Old Title.epub` keeps that filename (the file browser
+shows the new title, the classic filename view does not). It does not clear
+a field Tome has no value for - those fall back to whatever the file itself
+carries. It does not touch the files in the Tome library on the server.
+
+**Which books.** Only books the plugin already knows (downloaded through
+TomeSync, opened and resolved, or matched by a library sweep) **and** that
+Tome can verify by file hash: the server answers only for files whose hash
+it recorded when it scanned or served them. A file that never passed through
+Tome, or a different edition of the same book, is reported as "Not matched
+by Tome" and left alone, so one book's metadata can never land on another
+file. Books that are invisible to your account are treated the same way.
+
+**When it runs.** Shortly after KOReader starts, when WiFi connects, and
+after a library sweep finds new matches (automatic runs are debounced to one
+per two minutes). **Apply Tome metadata now** in the TomeSync menu runs it on
+demand, whether or not the automatic setting is on, and shows a summary:
+updated / unchanged / not matched by Tome / failed. The book currently open
+in the reader is skipped and picked up on the next run. Steady-state runs
+are cheap: the plugin sends a fingerprint per book and the server answers
+"unchanged" - no descriptions or covers move until something actually
+changed in Tome or on the device.
+
+Requires plugin build 42 (1.15.0) and a Tome server that ships it; on an
+older server the action reports that metadata sync is not supported.
+
+---
+
+## Ratings & reviews sync
+
+KOReader has its own **Book status** screen with a 1–5 star rating and a review
+(long-press a book → *Book status*, or the end-of-book screen). The plugin keeps
+that in step with the rating and review on Tome's book detail page, **both ways**:
+
+- Rate a book **on the web** and the next time you open it in KOReader (for a book
+  that came from Tome), the stars and review are written into the book.
+- Rate a book **in KOReader** and it flows up to Tome when you close or suspend.
+
+Ratings are **per user** and private to you. Reading status (reading / finished)
+is left untouched — that already syncs separately via reading progress.
+
+**How conflicts resolve.** The plugin remembers the last value it synced for each
+book, so normally only the side that actually changed is sent. If a book's rating
+changed on **both** the web and the device since the last sync, **Tome wins** — it
+is the single source of truth. As with highlights, this needs the **Tome-served
+copy** of the book so the plugin can match it to the right library entry; a
+sideloaded different copy won't sync its rating.
+
+---
+
+## API Keys
+
+The plugin authenticates with an API key (`Authorization: Bearer tk_...`), not your login password. Keys are managed in Tome's settings page:
+
+- A key is auto-created when you first download the plugin
+- Pairing a device via **Sign in with code** mints a key of its own (labelled with the device name)
+- You can create additional keys or revoke existing ones
+- Revoking a key immediately disables any plugin using it
+
+---
+
+## Moving servers & switching accounts
+
+The plugin download bakes in your server URL, API key and username, so a fresh
+install needs no configuration. Since plugin build 41 all three can also be
+changed on the device — no re-download or file editing needed.
+
+**The server moved** (new LAN IP, new domain, switched to HTTPS): open
+**TomeSync → Settings → Server URL** and enter the new address. This is the
+only recovery path that works after the fact — self-update can't help, because
+the device would be fetching updates from the old, dead address. If the new
+server does not accept the old API key (a different Tome instance, or the key
+was revoked), follow up with **Sign in with code**.
+
+**Switching accounts** (or signing in after a server change): use
+**Sign in with code**. The plugin shows a short pairing code; enter it in the
+Tome web UI on any signed-in browser under **Settings → Security → Quick
+Connect**. The device then receives its own API key and shows the account it
+now syncs as. Codes expire after 5 minutes; nothing on the device changes
+until pairing completes, so a failed attempt never breaks a working setup.
+
+**Back to square one**: **Reset connection to baked-in defaults** forgets all
+of the above and returns to what the download baked in.
+
+---
+
+## Updating the Plugin
+
+Once the plugin is installed, it updates itself — open the **TomeSync** menu and tap **Settings → Check for updates** (or enable **Auto-check for updates on launch**). It downloads the latest build from your server, swaps it in atomically, and asks you to restart. Your server URL, API key, and reading history carry over automatically.
+
+The plugin version is shown on the Settings page next to "TomeSync Plugin" (`v<semver> (build N)`); the build integer is what drives update comparisons.
+
+### How self-update can't brick the plugin
+
+The plugin is split into a frozen **shim** (`main.lua`, never replaced) and a replaceable **implementation** (`main_impl.lua`). On every load the shim runs a rollback state machine backed by `main_impl.lua.bak`:
+
+- A **download that fails validation** (too small, doesn't compile, missing sentinels) is rejected before anything is swapped — files untouched.
+- A **syntax-broken** update fails to load and is rolled back on the **same launch**.
+- An **init-crashing** update doesn't confirm itself, so the shim rolls it back on the **next launch**.
+- If even the backup is unusable, the shim loads a valid inert stub ("TomeSync failed to load — reinstall"); KOReader itself is never affected.
+
+### Manual install (first deploy / recovery)
+
+The **first** build carrying the shim+impl must be installed by hand once (every update after that is in-app). This is also the fallback if you ever need to force a clean reinstall.
+
+#### Via SSH (recommended for Kindle)
+
+```bash
+# 1. Download plugin ZIP from Tome Settings page, unzip it
+# 2. Deploy in one command:
+ssh root@<kindle-ip> "rm -rf /mnt/us/koreader/plugins/tomesync.koplugin" && \
+scp -r tomesync.koplugin root@<kindle-ip>:/mnt/us/koreader/plugins/
+# 3. Restart KOReader from its menu: Settings > Device > Restart KOReader
+```
+
+No cable or USB mode needed. Requires SSH enabled on KOReader (Settings > Network > SSH server).
+
+#### Via USB
+
+1. Exit KOReader
+2. Connect via USB cable
+3. Replace `koreader/plugins/tomesync.koplugin/` with the new version
+4. Eject and restart KOReader
+
+The downloaded plugin has your server URL and API key baked in, so there is nothing to configure after extracting.
+
+---
+
+## Troubleshooting
+
+**Plugin does not appear in the menu:**
+- Make sure the folder structure is `koreader/plugins/tomesync.koplugin/main.lua` (not double-nested)
+- Restart KOReader after installing
+- Check `koreader/crash.log` for errors
+
+**"Connection failed" on test:**
+- Verify your server is running and reachable from the e-reader's network
+- If you are on a VPN (e.g. Tailscale), make sure it is connected on the e-reader
+- If your server address changed, fix it under **Settings → Server URL** — see [Moving servers & switching accounts](#moving-servers--switching-accounts)
+
+**Wrong book matched:**
+- Use "Re-resolve all books" in the plugin menu, then re-open the book
+- The resolve endpoint matches by title and volume number; ambiguous titles may match incorrectly
+
+**Progress shows 0% on the web after syncing:**
+- The plugin only syncs when the book is matched to a Tome book ID
+- Check the plugin menu: if "Sync now" is greyed out, the book is not matched
+
+**Stats page is empty:**
+- Sessions are recorded when you close the lid or close a book. If you just started using the plugin, read for a while and close the lid to generate your first session.
+- If you were previously using an older version of the plugin that only recorded sessions on book close, re-download the latest version. The new version records a session every time you close the lid.
+
+**KOReader froze or became unresponsive:**
+- Older versions of the plugin could freeze KOReader for up to 60 seconds per request when the server was unreachable. Re-download the latest version, which has a 5-second timeout and automatic backoff.
+
+---
+
+## Files
+
+The plugin consists of three files (plus a backup created on first update):
+
+| File | Purpose |
+|---|---|
+| `_meta.lua` | Plugin metadata (name, description) |
+| `main.lua` | Frozen stable shim — loads the implementation and runs the anti-brick rollback state machine. No config; never replaced by self-update. |
+| `main_impl.lua` | All plugin logic, HTTP client, and config (server URL, API key baked in at download time; overridable on-device since build 41). The only file self-update replaces. |
+| `main_impl.lua.bak` | Last confirmed-good implementation, written automatically before each update so the shim can roll back. |

@@ -80,7 +80,7 @@ import {
   ClipboardList,
   ClipboardCheck,
   Check,
-
+  Box,
 } from "lucide-react";
 
 const MODALIDAD_OPTS = [
@@ -672,6 +672,15 @@ function Index () {
             >
               <FileSpreadsheet size={14} />
               <span>Padron Preliminar</span>
+            </Link>
+            <Link
+              to="/proyectos/$projectId/bim"
+              params={{ projectId }}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-[#dc2626] bg-white text-[#dc2626] hover:bg-[#fef2f2] text-[13px] font-medium"
+              title="Modelo BIM del proyecto"
+            >
+              <Box size={14} />
+              <span>BIM</span>
             </Link>
           </div>
 

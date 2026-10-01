@@ -8,9 +8,23 @@ import { defineConfig } from "@lovable.dev/vite-tanstack-config";
 
 const base = process.env.VITE_BASE_PATH || "/";
 
+// Vite reescribe `import(` como dynamic import aunque sea el nombre de un
+// método de clase; @thatopen/components define `import(...) {}` y el bundle
+// servido queda con sintaxis inválida. Se usa la forma `["import"](...)`.
+const fixThatOpenImportMethod = {
+  name: "fix-thatopen-import-method",
+  enforce: "pre" as const,
+  transform(code: string, id: string) {
+    if (!id.includes("thatopen")) return null;
+    const fixed = code.replace(/(\n\s*)import\(/g, '$1["import"](');
+    return fixed === code ? null : { code: fixed, map: null };
+  },
+};
+
 export default defineConfig({
   vite: {
     base,
+    plugins: [fixThatOpenImportMethod],
   },
   nitro: false,
   tanstackStart: {

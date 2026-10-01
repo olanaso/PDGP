@@ -1,0 +1,22 @@
+.git
+.venv
+.env
+.claude
+.pytest_cache
+.DS_Store
+node_modules
+frontend/node_modules
+data
+library
+bindery
+incoming
+books
+local
+tome.egg-info
+docs
+tests
+scripts
+*.md
+# …except the changelog — the What's-New panel serves it at runtime
+!CHANGELOG.md
+!pyproject.toml

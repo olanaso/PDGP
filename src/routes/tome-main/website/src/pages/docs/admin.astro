@@ -1,0 +1,198 @@
+---
+import DocsLayout from '../../layouts/DocsLayout.astro'
+import SectionHero from '../../components/SectionHero.astro'
+import DocsMeta from '../../components/DocsMeta.astro'
+import Callout from '../../components/Callout.astro'
+import { ThemedShot } from '../../components/ThemedShot'
+import { withBase } from '../../lib/path'
+---
+<DocsLayout title="Admin tools" description="Detect duplicates, merge books, and reorganise misplaced library files.">
+  <SectionHero section="reference" />
+  <h1>Admin tools</h1>
+  <p>
+    The admin panel (<strong>/admin</strong>) has tools for maintaining a clean library at scale:
+    duplicate detection, library health checks, word-count backfill, and an Email tab for Send to
+    Device. All admin-only.
+  </p>
+  <DocsMeta />
+
+  <div class="docs-shot">
+    <ThemedShot client:load name="admin-page" alt="Admin panel" />
+  </div>
+
+  <h2>Duplicate detection</h2>
+  <p>
+    Tome scans the library for potential duplicates using four strategies, from most to least
+    confident:
+  </p>
+  <table>
+    <thead><tr><th>Strategy</th><th>What it matches</th><th>Use case</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Content hash</strong></td>
+        <td>Identical file contents</td>
+        <td>Exact same file imported twice</td>
+      </tr>
+      <tr>
+        <td><strong>ISBN</strong></td>
+        <td>Same ISBN across books</td>
+        <td>Different files of the same edition</td>
+      </tr>
+      <tr>
+        <td><strong>Author + series + index</strong></td>
+        <td>Same author, series name, and volume number</td>
+        <td>Different formats of the same volume (EPUB + CBZ)</td>
+      </tr>
+      <tr>
+        <td><strong>Fuzzy title + author</strong></td>
+        <td>Title similarity &gt; 85% with same author</td>
+        <td>Slightly different titles ("Vol. 1" vs "Volume 1")</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Resolving duplicates</h3>
+  <p>
+    Resolution works in one pass: for each group, pick the book to keep and queue an action, then
+    apply everything with a single <strong>Apply All</strong>. Nothing happens until you confirm,
+    and a summary afterwards reports what was applied and anything that failed. Three actions are
+    available per group:
+  </p>
+  <ul>
+    <li><strong>Merge</strong> — fold the other copies into the kept book. Files, tags, library
+      memberships, and reading status carry over. File entries whose file is missing from disk are
+      dropped rather than carried along.</li>
+    <li><strong>Delete Others</strong> — keep the selected book and delete the other copies,
+      including their files on disk. Useful when the copies really are redundant files, not
+      alternate formats worth merging.</li>
+    <li><strong>Dismiss</strong> — mark the group as not-a-duplicate. Dismissed pairs are stored
+      permanently and excluded from future scans.</li>
+  </ul>
+  <p>
+    Copies whose file no longer exists on disk are badged <strong>MISSING</strong> on their format
+    chip, so dead entries are easy to tell apart from the real copy before you decide.
+  </p>
+
+  <Callout variant="info" title="Fuzzy matches need review">
+    The fuzzy title strategy intentionally casts a wide net. It may flag different volumes of the
+    same series as duplicates. Use dismiss liberally — it's what it's there for.
+  </Callout>
+
+  <h2>Library health</h2>
+  <p>
+    The Library Health tab scans the filesystem for two kinds of problems: books whose on-disk
+    path doesn't match their expected location based on current metadata, and orphaned entries —
+    books whose file no longer exists on disk at all.
+  </p>
+
+  <h3>Orphaned entries</h3>
+  <p>
+    If files were deleted or moved outside of Tome (from a shell, another tool, or a cleanup gone
+    wrong), their database entries stay behind: the books error on open, and re-importing the same
+    file gets skipped as a duplicate of the dead entry. The scan lists every such entry with a
+    badge showing what removal would do: <em>book entry will be removed</em> when no file is left,
+    or <em>file entry only</em> when the book keeps another file that still exists.
+  </p>
+  <p>
+    <strong>Remove Dead Entries</strong> (confirm-gated) cleans them up in one click — dead file
+    entries are removed, and books left with no files are deleted entirely. Entries whose file
+    actually exists on disk are always refused: this action only ever touches the database, never
+    your files.
+  </p>
+
+  <h3>Misplaced files</h3>
+  <p>
+    Path mismatches happen when you rename a series, change an author, or import books before
+    their metadata was corrected.
+  </p>
+  <p>
+    Misplaced files are grouped by series and author. For each one, Tome shows the current path
+    and where it should be. You can:
+  </p>
+  <ul>
+    <li><strong>Preview</strong> — dry-run the reorganisation to see what would move</li>
+    <li><strong>Reorganise</strong> — move files to their correct paths and clean up empty folders</li>
+  </ul>
+
+  <Callout variant="warning" title="Reorganise moves files on disk">
+    This physically moves files in your <code>TOME_LIBRARY_DIR</code>. The database updates to
+    match. If you mount <code>/books</code> as read-only, reorganise will fail — remount as
+    read-write first.
+  </Callout>
+
+  <h2>Cover audit</h2>
+  <p>
+    <strong>Admin → Covers</strong> lists books whose covers are missing, unreadable, or
+    genuinely low-resolution (real thumbnails — the threshold is chosen so standard-source
+    covers pass), with dimensions shown. Books with no cover at all offer a one-click
+    auto-fix that applies the first cover-search candidate — safe, since there is nothing to
+    downgrade. Low-resolution covers deliberately don't auto-fix (a blind refetch could make
+    them worse); their rows deep-link to the book page, where the cover picker shows
+    candidates to judge by eye.
+  </p>
+
+  <h2>Instance backup &amp; restore</h2>
+  <p>
+    <strong>Admin → Server → Instance backup</strong> downloads everything Tome knows in one
+    archive: a consistent snapshot of the database (safe to take while the server runs) plus
+    the cover cache and a manifest. Book files are not included — they live on disk and
+    belong to your own backups.
+  </p>
+  <p>
+    Restoring is deliberately two-phase: upload an archive, type <code>RESTORE</code> to arm
+    it, and the swap happens at the <em>next server restart</em> — never under a live
+    database. The current database is kept alongside as
+    <code>tome.db.pre-restore-&lt;timestamp&gt;</code>, a staged restore can be cancelled any
+    time before the restart, and an invalid archive is rejected at upload. Backup downloads
+    and every restore step land in the <a href="#audit-log">audit log</a>.
+  </p>
+
+  <h2>Word counts</h2>
+  <p>
+    Tome records each EPUB's word count, shown in the <strong>Details</strong> panel on the book
+    page. New uploads are counted automatically as they're added — the <strong>Word Counts</strong>
+    tab is only for backfilling books that were in your library before the feature existed.
+  </p>
+  <div class="docs-shot">
+    <ThemedShot client:load name="admin-word-counts" alt="The Word Counts admin tab: EPUB totals, already-counted and pending counts, and the backfill control" />
+  </div>
+  <p>
+    The tab shows how many EPUBs you have, how many already have a count, and how many are still
+    pending. Start the backfill and it runs in the background: progress, an ETA, and the running
+    word total update live. You can leave the page — it keeps going — and come back to a stop
+    button and a final summary.
+  </p>
+  <ul>
+    <li><strong>EPUB only.</strong> PDFs and comics (CBZ/CBR) don't get a word count.</li>
+    <li><strong>CJK aware.</strong> Chinese, Japanese, and Korean text is counted per character so
+      those titles aren't undercounted.</li>
+    <li><strong>Resumable.</strong> Stop any time, or restart after a server restart — it only
+      processes books that still need a count, so re-running just finishes the rest.</li>
+    <li><strong>Retry.</strong> A handful of EPUBs have malformed packaging that the normal parser
+      rejects; Tome falls back to reading the text straight from the file. Anything still uncounted
+      is reported, and a <strong>Retry failed</strong> button re-runs just those.</li>
+  </ul>
+
+  <Callout variant="info" title="Files are never modified">
+    Counting only reads your EPUBs and writes one number per book in the database. Nothing on disk
+    is touched. Word counts power the words-read and reading-speed stats.
+  </Callout>
+
+  <h2>Email (Send to Device)</h2>
+  <p>
+    The Email tab shows SMTP status (configured or not, with host/port/from), a
+    <strong>Send test email</strong> button, every user's saved devices, and recent send history —
+    who sent which book to which device, and whether it succeeded. SMTP itself is configured via
+    environment variables; see <a href={withBase("/docs/send-to-device")}>Send to Device</a>.
+  </p>
+  <h2 id="audit-log">Audit log</h2>
+  <p>
+    <strong>Admin → Audit Log</strong> records who did what, when: user management, book
+    deletions and uploads, metadata edits, downloads (single and bulk), credential
+    lifecycles (API tokens, OPDS PINs, KOReader plugin keys, notification channels —
+    never the secrets themselves), backup and restore steps, imports, and curation
+    changes. Reads and device sync telemetry are deliberately not logged — they would
+    flood the trail without forensic value.
+  </p>
+
+</DocsLayout>

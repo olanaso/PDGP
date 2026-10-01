@@ -1,0 +1,1687 @@
+---
+name: scribe
+description: Batch-import ebooks into a Tome library via its HTTP API. Triggers on /scribe, "import books into tome", "import this folder", "batch-ingest".
+trigger: /scribe
+---
+
+# Scribe — Tome Batch Import Skill
+
+Import a folder of ebooks into a running Tome instance.  Claude reads this
+file and executes the workflow step-by-step.  The user never has to write
+curl commands or parse JSON manually.
+
+## Modes
+
+- `/scribe <path>` — ingest a folder or set of files into Tome
+- `/scribe update <query>` — refresh metadata on existing books by free-text query
+- `/scribe audit [scope]` — scan for weak metadata and series title drift; offer bulk fixes
+- `/scribe series <name>` — fill series-level metadata (status + arcs) from LLM knowledge
+
+## Output discipline
+
+Default mode is TERSE.  Never echo full metadata in the main flow.  Never
+print per-file decision reasoning.  Print counts and ambiguous cases only.
+Verbose output only when the user explicitly asks ("show details", "verbose",
+"what did you pick for #3").  Judgment decisions are written to
+`.scribe-state.json` in the target directory, not to chat.
+
+Reason: output tokens cost ~5x input tokens.  A 200-book import should fit
+in a screen.
+
+---
+
+## Profiles
+
+A **profile** is a named connection to a Tome instance — its URL and API token.
+All profiles live in `~/.config/tome/scribe.json` under the `profiles` key.
+
+**Config shape:**
+```json
+{
+  "profiles": {
+    "dev":  {"url": "http://localhost:8080",    "token": "tome_..."},
+    "prod": {"url": "https://tome.example.com", "token": "tome_..."}
+  }
+}
+```
+
+**How to add a profile:** say "add a profile", "add prod", or "register another instance".
+Scribe will prompt for the name, URL, and token, validate connectivity, then merge
+the new entry into `profiles` without touching existing ones.
+
+**How to select a profile in a command:**
+- Explicit: `"scribe on prod"`, `"use dev"`, `"/scribe --profile prod <path>"`,
+  `"on prod, audit the manga library"` — Claude extracts the name and uses it.
+- Implicit (single profile): if `profiles` has exactly one entry, use it silently.
+- Unspecified (multiple profiles): Claude **always asks** — no default, no guessing.
+  Example: `"Which instance? You have: dev, prod."` Wait for the answer before continuing.
+
+**Config file location:** `~/.config/tome/scribe.json` (permissions: 600).
+
+For full setup details and URL normalization rules, see Step 0 below.
+
+---
+
+## Step 0 — Config / first-run setup
+
+Read `~/.config/tome/scribe.json`.
+
+### 0a — Legacy migration (flat config)
+
+If the file exists and has the old flat shape `{"url": "...", "token": "..."}` (no
+`profiles` key), prompt the user once:
+
+> "Found a single-profile config. What should I name it (e.g. 'dev', 'prod')?"
+
+After they reply, rewrite the file as:
+```json
+{"profiles": {"<name>": {"url": "<existing url>", "token": "<existing token>"}}}
+```
+Preserve the existing `url` and `token` values exactly — do NOT re-validate or
+re-prompt for them.  Then proceed normally with the named profile.
+
+### 0b — Empty / missing file (first run)
+
+If the file does not exist or is empty:
+
+1. Tell the user: "Scribe needs a Tome instance name, URL, and an API token.
+   Go to Tome → Settings → API Tokens, create one named e.g. `scribe-laptop`,
+   and copy the token."
+2. Ask in a single message: "Instance name (e.g. 'dev', 'prod')?" and
+   "Tome URL (e.g. http://localhost:8080)?" and "API token?"
+3. Once they reply, **normalize the URL before saving**:
+   - Strip any path segments after the host:port — e.g.
+     `http://localhost:8080/settings` → `http://localhost:8080`
+   - If the port is `5173` (the Vite frontend dev server), swap it to `8080`
+     (where Tome's API runs) and warn the user:
+     "I'll use :8080 since that's where Tome's API runs."
+   - Examples:
+     - `http://localhost:5173/settings` → `http://localhost:8080`
+     - `http://192.168.1.10:8080/books` → `http://192.168.1.10:8080`
+     - `https://tome.example.com/settings` → `https://tome.example.com`
+4. Validate connectivity **before writing the config**:
+
+```bash
+curl -sf -o /dev/null -w "%{http_code}" \
+  -H "Authorization: Bearer <TOKEN>" "<NORMALIZED_URL>/api/health"
+```
+
+   - If the response is 200, write the file:
+
+```bash
+mkdir -p ~/.config/tome
+cat > ~/.config/tome/scribe.json <<'EOF'
+{"profiles": {"<NAME>": {"url": "<NORMALIZED_URL>", "token": "<TOKEN>"}}}
+EOF
+chmod 600 ~/.config/tome/scribe.json
+```
+
+   - If not 200, tell the user: "Could not reach Tome at <URL> — got HTTP
+     <status>.  Please check the URL and token, then try again."  Do not save
+     the config.  Ask the user to fix and retry.
+
+### 0c — Adding a profile
+
+If the user says "add a profile", "add prod", "register another instance", or similar:
+
+1. Prompt: "Instance name?" and "Tome URL?" and "API token?"
+2. Normalize the URL using the same rules as 0b.
+3. Validate connectivity via `GET /api/health` as above.
+4. On success, read the current `~/.config/tome/scribe.json`, merge the new profile
+   into the `profiles` object, and write the file back.  Do not touch existing profiles.
+
+### 0d — Profile selection
+
+Before ANY action that hits Tome, resolve which profile to use:
+
+- **Explicit in the command:** `"scribe on prod"`, `"use dev"`,
+  `"/scribe --profile prod <path>"`, `"on prod, audit the manga library"` —
+  extract the profile name and use it.  If that name does not exist in `profiles`,
+  tell the user and list available names.
+- **Single profile exists:** use it silently.  No prompt needed.
+- **Multiple profiles, none specified:** **always ask. Never default. Never guess.**
+  Prompt: `"Which instance? You have: dev, prod."` Wait for the user's reply
+  before proceeding with any API call.
+
+Once resolved, bind shell variables for the rest of the run:
+```bash
+PROFILE="<name>"
+URL="<profiles[PROFILE].url>"
+TOKEN="<profiles[PROFILE].token>"
+```
+
+All subsequent steps use `$URL` and `$TOKEN` sourced from the selected profile.
+
+---
+
+## Step 1 — Discover
+
+Run the extract script against the target path.  The script is at
+`skills/scribe/scripts/extract.py` relative to the Tome repo root.  Resolve
+the repo root as the directory containing this SKILL.md's parent `skills/`
+folder.
+
+### Calling extract.py — argument rules
+
+**Never call extract.py with a single file path when the user intended a
+batch.**  The script recurses directories; calling it on a single file gives
+"Found 1 files" and loses the rest of the batch.
+
+- **User passes a directory** → call `extract.py <dir>` — it recurses.
+- **User passes individual files or multiple files from the same parent** →
+  call `extract.py <common_parent_dir>` once, then filter the resulting JSON
+  array to only the entries whose `path` appears in the user's list.
+- **Mixed paths from different parents** → find the deepest common ancestor
+  directory, call `extract.py <common_ancestor>`, then filter to the user's
+  list.
+
+```bash
+EXTRACT="<abs-path-to-repo>/skills/scribe/scripts/extract.py"
+python3 "$EXTRACT" "<target_path>" > /tmp/scribe_files.json
+```
+
+Parse the JSON array.  Each item has: `path`, `format`, `size_bytes`,
+`content_hash`, `embedded` (dict of title/author/series/series_index/year/
+isbn/language), `filename_hints` (same fields parsed from filename).
+
+After filtering to the user's intended files (if applicable), write the
+filtered list back to `/tmp/scribe_files.json`.
+
+Print: `"Found N files."` — nothing more.
+
+---
+
+## Step 2 — Resume check
+
+If `<target_path>/.scribe-state.json` exists, read it.
+
+Check that the `profile` field inside the state JSON matches the currently
+active `$PROFILE`.  If it does not match, warn:
+
+> "This state file was created against profile '<old_profile>', but you are
+> currently using '<current_profile>'.  Resuming may apply changes to the
+> wrong Tome instance.  Continue anyway? (yes / start fresh)"
+
+If the profile matches (or the user confirms), ask:
+`"Found a previous run with X files processed. Resume? (yes / start fresh)"`
+
+If resuming: load state and skip to Step 5 (upload), processing only entries
+whose `status` is not `"uploaded"`.
+
+If starting fresh or no state file: proceed.
+
+---
+
+## Step 3 — Deduplicate
+
+Extract all `content_hash` values from the discovered files and POST to
+check-hashes:
+
+```bash
+HASHES=$(python3 -c "
+import json, sys
+files = json.load(open('/tmp/scribe_files.json'))
+print(json.dumps({'hashes': [f['content_hash'] for f in files]}))
+")
+curl -sf -X POST "$URL/api/books/check-hashes" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "$HASHES" > /tmp/scribe_existing.json
+```
+
+Remove files whose `content_hash` appears in `existing`.  Print:
+`"Skipped N duplicates."` (or omit the line if 0).
+
+---
+
+## Step 4 — Fetch libraries and book types
+
+```bash
+curl -sf -H "Authorization: Bearer $TOKEN" "$URL/api/libraries" \
+  > /tmp/scribe_libraries.json
+curl -sf -H "Authorization: Bearer $TOKEN" "$URL/api/book-types" \
+  > /tmp/scribe_book_types.json
+```
+
+Parse both.  You will use them for library assignment in Step 4c.
+
+---
+
+## Step 4a — Ingest with embedded metadata (batch)
+
+For each non-duplicate file, upload it immediately using the `embedded`
+metadata from the extract step.  Do NOT wait for metadata fetching first —
+ingest creates the book record so we can call `fetch-metadata` against its id.
+
+Build the metadata JSON from `embedded` fields.  Apply filename_hints as
+fallback for missing fields.  Always include `title` (required).
+
+```bash
+# For each file:
+METADATA=$(python3 -c "
+import json
+embedded = <embedded dict>
+hints = <filename_hints dict>
+# Merge: embedded wins over hints
+merged = {**hints, **{k: v for k, v in embedded.items() if v is not None}}
+# Keep only ingest-schema fields
+fields = ['title','subtitle','author','series','series_index','isbn',
+          'publisher','description','language','year','tags',
+          'library_ids','book_type_id']
+out = {k: merged[k] for k in fields if k in merged}
+print(json.dumps(out))
+")
+curl -sf -X POST "$URL/api/books/ingest" \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@<abs_path>" \
+  -F "metadata=$METADATA" \
+  -w "\n%{http_code}" \
+  > /tmp/scribe_upload_<i>.json
+```
+
+On HTTP 201: record `book_id` from response.
+On HTTP 409: the file is a duplicate (race condition with Step 3). Note as
+  skipped.
+On other errors: log the error, mark file as failed, continue.
+
+Save all results to `.scribe-state.json` in the target dir after each file
+(so a crash is resumable).
+
+State file schema:
+```json
+{
+  "profile": "<active profile name>",
+  "target_path": "/abs/path",
+  "run_at": "ISO timestamp",
+  "files": [
+    {
+      "path": "/abs/path/to/file.epub",
+      "content_hash": "abc...",
+      "status": "pending|uploaded|skipped|error",
+      "book_id": 42,
+      "error": null,
+      "confidence": "auto|ambiguous|no_match|null",
+      "chosen_candidate_index": null,
+      "metadata_applied": false,
+      "pinned_fields": null
+    }
+  ]
+}
+```
+
+Note: the `profile` field at the top level is used by Step 2's resume check
+to detect cross-profile resume attempts.
+
+After the full batch, print one terse line:
+`"Uploaded N. Skipped K (duplicates/errors). Errors: [list if any]"`
+
+---
+
+## Step 4b — Context enrichment — check Tome for siblings
+
+**Run this before the pre-classification.**  For each uploaded file in the
+batch, look up existing books in Tome that share the same series or author.
+Record any matches as `pinned_fields` in the state file.
+
+Sibling-lookup is context enrichment only.  Finding siblings does NOT skip
+fetch-metadata.  It only pins canonical fields (author, series spelling,
+book_type, library assignment, title_template) so the candidate scoring and
+apply step can use them to improve accuracy and prevent series drift.
+
+No chat output unless the user asks.
+
+For each file:
+
+1. Derive a `series` guess from `embedded.series` or `filename_hints.series`.
+2. If `series` is non-empty, query Tome:
+
+```bash
+curl -sf -H "Authorization: Bearer $TOKEN" \
+  "$URL/api/books?series=<url-encoded-series-name>" \
+  > /tmp/scribe_siblings_<i>.json
+```
+
+   The `series` query param is an exact-match filter (confirmed against
+   `backend/api/books.py`).  URL-encode the series name.
+
+3. If results exist (at least one book), extract `pinned_fields` from the
+   first (lowest `series_index`) sibling:
+   - `author` — exact string from the sibling book
+   - `series` — exact canonical spelling/casing
+   - `book_type_id` — from the sibling book
+   - `library_ids` — from the sibling book
+   - `title_template` — inspect the sibling titles and detect the pattern:
+     - If siblings are titled "Sherlock Holmes, Vol. 1", "Sherlock Holmes, Vol. 2" →
+       template is `"Sherlock Holmes, Vol. <index>"`
+     - If siblings use inconsistent formats (i.e. would be Case B under the
+       drift detection rule in Step A2), omit `title_template` — do not guess
+       a canonical form here.  The audit mode's drift detection step will surface
+       the inconsistency properly.
+     - Only set `title_template` if at least 2 siblings exist and they agree
+
+4. If no series, fall back to `author` lookup:
+
+```bash
+curl -sf -H "Authorization: Bearer $TOKEN" \
+  "$URL/api/books?author=<url-encoded-author>" \
+  > /tmp/scribe_siblings_<i>.json
+```
+
+   Extract `author`, `book_type_id`, `library_ids` from the first result.
+   Do **not** set `title_template` for author-only lookups.
+
+5. If no siblings at all, `pinned_fields` is `null` — normal flow continues.
+
+Write `pinned_fields` into each file's state entry.  Do not print anything.
+
+---
+
+## Step 4c — Pre-classify metadata quality (silent)
+
+Before calling any external API, inspect each ingested book's metadata
+(already captured from the extract step) and classify it silently as
+`confidence: "auto"` or `confidence: "ambiguous"`.  Persist the classification
+to `.scribe-state.json`.  Print nothing.
+
+This classification only decides **how candidates are presented to the user
+after fetch**.  It does NOT skip fetching.
+
+**Auto — top candidate is applied silently after fetch:**
+- Title is present, non-empty, and does not look like a filename artifact
+  (e.g. "chapter-03", "vol_12", a bare number, "Book", "Untitled").
+- Author is present and non-empty.
+- At least one of `{year, isbn, publisher}` is present.
+- Filename hints do not contradict embedded metadata egregiously (e.g.
+  filename says "Sherlock Holmes vol 3" but embedded title is "Around the World in Eighty Days" →
+  not auto).
+
+**Ambiguous — surface candidates to the user after fetch:**
+- Title or author missing, empty, or obviously garbage.
+- All publication fields (`year`, `isbn`, `publisher`) are absent.
+- Embedded metadata vs. filename hints disagree on title or series.
+- Title looks auto-generated ("Book", "Untitled", a bare number, or a
+  slug-style string like "chapter-03").
+
+Add `confidence` and `metadata_applied` fields to each file's state entry.
+Do NOT print per-file decisions.
+
+---
+
+## Step 4d — Fetch metadata candidates (ALL books)
+
+**Fetch-metadata runs for every ingested book without exception.**  Even if
+sibling-lookup found matches, or the pre-classification is `auto`, every book
+still needs a candidate fetch — because description, cover, year, publisher,
+tags, and ISBN are per-book fields that siblings cannot supply.
+
+For each uploaded book, call:
+
+```bash
+curl -sf -H "Authorization: Bearer $TOKEN" \
+  "$URL/api/books/<book_id>/fetch-metadata" \
+  > /tmp/scribe_candidates_<book_id>.json
+```
+
+**Important:** `GET /api/books/{book_id}/fetch-metadata` requires an existing
+book_id. This is why ingest comes before metadata fetch — the book must exist
+first.  You can optionally pass `?q=<title+author>` to override the search
+query if embedded metadata is weak.
+
+Run all curl calls concurrently (via `&` + `wait` in bash, or sequentially if
+count <= 10 to avoid hammering external APIs).
+
+Do NOT print anything per-book.
+
+After receiving candidates, score and classify each result using the
+**candidate scoring heuristic** below.  Pick the highest-scoring candidate as
+the top-ranked choice; if multiple candidates tie or none pass the threshold,
+keep the `ambiguous` classification from Step 4c.
+
+Classification rules (applied after scoring, may override Step 4c):
+- `auto`: top candidate scores >= 5 AND no other candidate is within 2 points
+  of it — apply silently without user interaction.
+- `ambiguous`: candidates exist but none pass the `auto` threshold, OR multiple
+  pass with very similar scores — surface to user for manual resolution.
+- `no_match`: zero candidates returned — keep embedded/pinned fields as-is.
+
+Write classification + chosen candidate index (best score for `auto`;
+`null` for `ambiguous` and `no_match`) to the state file.
+
+Do NOT print per-file decisions.
+
+---
+
+## Candidate scoring heuristic
+
+Apply this to every candidate for a given book.  Sum the points; higher is
+better.  Use this consistently — do not invent a different scorer at runtime.
+
+| Condition | Points |
+|-----------|--------|
+| `candidate.title` matches `pinned_fields.title_template` exactly (case-insensitive, index substituted) | +8 |
+| `candidate.author` matches `pinned_fields.author` (case-insensitive) | +5 |
+| `candidate.author` matches filename-hint author (case-insensitive) | +5 |
+| `candidate.series_index` equals parsed filename/embedded volume number | +4 |
+| `candidate.title` contains the series name (case-insensitive) | +3 |
+| `candidate.year` is within ±1 of embedded/filename year | +2 |
+| `candidate.author` disagrees with any pinned field | -3 |
+| `candidate.series` disagrees with `pinned_fields.series` (both present, clearly different) | -3 |
+| `candidate.title` contains a foreign-edition keyword (regex `\b(max\|deluxe\|gigante\|band\|maximum\|edizione\|integrale\|kanzenban)\b`, case-insensitive) and the pinned language is English | -8 |
+
+**Why the foreign-edition penalty:** without it, candidates like "Berserk Max
+Band 12" tie with "Berserk, Vol. 12" on series-index + author, and source
+tie-break picks the wrong one.  The penalty breaks the tie decisively.
+
+**Tie-break:** prefer source order **Hardcover > Google Books > Open Library**.
+This matches the backend's actual fetch order in `backend/services/metadata_fetch.py`
+(Hardcover results are prepended first, then Google Books, then Open Library).
+
+---
+
+## Web fallback for missing descriptions
+
+This subsection applies whenever a book's best metadata candidate has an
+empty, null, or short description.  It is used in ingest (after Step 4d),
+update (after Step U4), and audit (after Step A4) — wherever descriptions are
+being enriched.
+
+**Trigger conditions (check both):**
+
+1. The top-ranked candidate's `description` field is null, empty string, or
+   shorter than 200 characters.
+2. The field being filled is `description` only.  Do NOT use web search to
+   override author, series, year, cover, or other fields — those come from
+   fetch-metadata candidates, sibling pinning, or user input.
+
+**Procedure:**
+
+1. Build a search query: `"<title>" <author> book plot summary`
+   - Quote the title (wrap in `"`) if it has more than two words.
+   - Include the author if known.
+   - Examples:
+     - `"Barsoom" Edgar Rice Burroughs book plot summary`
+     - `"Around the World in Eighty Days" Jules Verne book plot summary`
+
+2. Run `WebSearch` with that query.
+
+3. Pick the **top trustworthy result** in priority order:
+   - Goodreads
+   - Wikipedia
+   - Official publisher page (VIZ, Dark Horse, Yen Press, Tor, Del Rey, etc.)
+   - Author's official site
+   - Skip: blogs, fan wikis, obvious SEO spam, "top 10 books" listicles,
+     retailer product pages (Amazon, Barnes & Noble) — these often have
+     truncated or marketing-copy descriptions.
+
+4. Run `WebFetch` on the chosen URL.  Extract only the synopsis /
+   description / plot-summary section.  Apply these constraints:
+   - Minimum useful length: 100 characters (below this, discard and fall back).
+   - Maximum to apply: 2000 characters.  Trim at the nearest sentence boundary.
+   - Strip: star ratings, review quotes, "also by the author" sections,
+     metadata sidebars, "buy now" CTAs, chapter lists, spoiler sections.
+
+5. Verify the fetched text is for the **correct book** — check that title and
+   author are mentioned or clearly implied.  If the page is for a different
+   edition, different volume, or a different book entirely, discard it.
+
+6. If the web result is still empty, too short, or clearly wrong after steps
+   3-5, fall back to the original candidate's description even if it is short,
+   or leave the field empty.  Log a note in the state file (`"web_fallback":
+   "failed — no good result"`).  Do not keep retrying with more URLs.
+
+**Source attribution in reports:**
+
+When a description is sourced from a web fallback, note the source in the
+user-facing diff / apply report.  Examples:
+
+```
+#1 A Princess of Mars  [id=10]
+  description:  (empty) → 489c  [from Wikipedia]
+```
+
+Do **not** embed attribution text inside the description field itself — keep
+the stored description clean.
+
+**State file field:**
+
+Add `"web_fallback_source": "<url or null>"` to the per-book state entry when
+a web fallback is used.  This allows the run to be audited later.
+
+---
+
+## Cover placeholder detection and fallback
+
+This subsection applies whenever a cover is being applied from a
+fetch-metadata candidate or a `cover-candidates` result — during ingest
+(Step 4d/4f), update mode, or audit mode.
+
+**Why it exists:** Hardcover and Google Books occasionally return generic
+placeholder images instead of real covers — a blank grey/blue JPEG, a
+series-logo stock card, or the publisher's default-cover art.  Applied blindly,
+these replace decent embedded covers with worse ones.
+
+**Placeholder signals (check the fetched image, not the URL):**
+
+1. File size is suspiciously small or suspiciously uniform across volumes:
+   - Under ~20 KB is almost always a placeholder.
+   - Identical byte size across multiple volumes of the same series is a
+     strong signal the source is returning the same stock image.
+2. Image dimensions are tiny (< 200px on the shorter edge) or exactly square
+   for a format that is normally portrait (manga/comics are ~2:3).
+3. The image is visually a solid color — low variance across pixels.  A
+   quick heuristic: if the first-byte histogram of a JPEG is dominated by a
+   single byte run, it is probably solid-fill.
+4. The same cover URL / same content-hash appears for multiple adjacent
+   volumes in the same series (the source is repeating stock art).
+
+**Fallback order when a placeholder is detected:**
+
+1. Try the next candidate in source-rank order: **Hardcover → Google Books
+   → Open Library**.  Skip any candidate that matches the placeholder signals
+   above.
+2. If all `fetch-metadata` candidates fail, call
+   `GET /api/books/{id}/cover-candidates` — this is a separate endpoint that
+   aggregates cover art specifically, and sometimes returns options that the
+   metadata fetcher omitted.
+3. If that also fails, do a `WebSearch` for the publisher's official product
+   page: `"<series>" vol <N> <publisher> cover`.  Prefer Dark Horse, VIZ, Yen
+   Press, Seven Seas, Kodansha, Tor, Del Rey over retailer pages.  `WebFetch`
+   the page and extract the canonical cover asset URL.
+4. Apply via `POST /api/books/{id}/cover` with form field `url=<image_url>`.
+   The backend downloads and caches the image under `data/covers/`.
+5. If no good cover is findable after steps 1-3, leave the existing cover
+   (or keep the field empty) and note `"cover_fallback": "failed"` in the
+   state file.  Do not keep trying.
+
+**Source attribution in reports:**
+
+```
+#12 Berserk, Vol. 19  [id=506]
+  cover:  (placeholder, 8.2 KB) → 412 KB  [from Dark Horse]
+```
+
+**State file field:**
+
+Add `"cover_fallback_source": "<url or null>"` to the per-book state entry
+when a cover fallback is used.
+
+---
+
+## Step 4e — Library assignment
+
+Default rule: assign each book to the library associated with its book_type
+(the `library_id` field on the BookType).  If book_type_id was not set (no
+embedded metadata for it), assign to no library for now.
+
+If `pinned_fields.library_ids` exists for a book, use those library IDs
+instead of the default rule.
+
+If 5 or more books share the same series or author and have no book_type_id,
+ask once: `"N books look like <series/author> — which book type? (options:
+<list slugs from /api/book-types>)"`.  Apply that type to all of them via
+`PUT /api/books/<id>` with `{"book_type_id": <id>}`.
+
+Never ask per-book questions about library assignment.
+
+---
+
+## Step 5 — Report ambiguous cases
+
+After fetch and scoring, print a terse summary:
+
+```
+Uploaded 42  |  auto-applied 38  |  needs review 3  |  no candidates 1  |  skipped 2 dups
+```
+
+Then render a compact table of ambiguous books only:
+
+```
+#  Title (embedded)            Candidates
+1  Some Book Name              [A] "Some Book" 2019 Penguin  [B] "Some Book Name" 2021 Tor  [C] "Some Book" 2018 (no publisher)
+2  Another Title               [A] "Another Title" by J. Smith 2020  [B] "Another" by J. Smith 2019
+3  Unknown Title               (no candidates)
+```
+
+Then prompt: `"How should I handle these? Options: 'accept all A', '#2 use B',
+'#3 skip metadata', 'skip all', or 'show me #1's full candidates'."`
+
+---
+
+## Step 6 — User resolves ambiguous
+
+Parse the user's reply.  Examples:
+
+- `"accept all A"` → use candidate index 0 for all ambiguous books
+- `"accept all"` → use best-scored candidate for each
+- `"#2 is B"` → use candidate index 1 for book #2
+- `"#3 skip"` or `"skip #3"` → leave book #3 with embedded metadata only
+- `"show #1"` → print all candidate fields for book #1 (verbose drill-down)
+- `"skip all"` → leave all ambiguous with embedded metadata
+
+After resolution, apply chosen candidates via:
+
+```bash
+curl -sf -X POST "$URL/api/books/<book_id>/apply-metadata" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '<ApplyMetadataRequest JSON>'
+```
+
+### Respecting pinned fields at apply time
+
+`POST /api/books/{id}/apply-metadata` supports partial payloads — only
+provided fields are updated.  Use this to protect pinned values:
+
+1. Start from the chosen candidate's fields.
+2. **Overwrite** any key that exists in `pinned_fields` back to the pinned
+   value — never let a candidate's value replace a pinned field.
+3. If `pinned_fields.title_template` is set, regenerate the title:
+   - Find the volume/series_index for this book (from candidate, embedded, or
+     filename hint — in that priority order).
+   - Substitute into the template, e.g. template `"Sherlock Holmes, Vol. <index>"` +
+     index `3` → title `"Sherlock Holmes, Vol. 3"`.
+4. Build the final payload from the modified fields and POST it.
+
+Rationale: this prevents series drift.  If `fetch-metadata` returns
+`"Doyle Arthur Conan"` but all existing siblings use `"Arthur Conan Doyle"`, we keep
+the consistent spelling.
+
+For `auto` books, apply the chosen candidate automatically (no user
+interaction), respecting pinned fields as above.
+
+For `no_match`, apply nothing (embedded stays).
+
+---
+
+## Step 7 — Final summary
+
+Print one terse line:
+
+```
+Done. Uploaded 42 books, applied metadata on 38, skipped 3 (1 duplicate, 2 errors).
+See $URL/books for review.
+```
+
+Offer: `"Type 'list errors' for details or 'show skipped' to see what was
+left out."`
+
+Clean up `/tmp/scribe_*.json` temp files.
+
+---
+
+## Notes on API shape (verified against Tome source)
+
+- `POST /api/books/check-hashes` — body `{"hashes": [...]}`, response
+  `{"existing": {"<hash>": <book_id>}}`.  Auth: Bearer token.
+
+- `POST /api/books/ingest` — multipart form: `file` (binary) + `metadata`
+  (JSON string).  Returns 201 + BookDetailOut on success, 409 +
+  `{"detail": {"detail": "duplicate", "existing_id": N}}` on dup.
+  Sets `is_reviewed=true` automatically.
+
+- `GET /api/books?series=<exact-name>` — exact-match series filter.  Returns
+  paginated book list.  Also supports `?author=<name>` for author filtering.
+  Both are simple string equality checks in the backend (not substring/fuzzy).
+
+- `GET /api/books/{book_id}/fetch-metadata?q=<optional override>` — returns
+  `list[MetadataCandidateOut]`.  Each candidate: `source`, `source_id`,
+  `title`, `author`, `description`, `cover_url`, `publisher`, `year`,
+  `page_count`, `isbn`, `language`, `tags`, `series`, `series_index`.
+
+- `POST /api/books/{book_id}/apply-metadata` — body: any subset of
+  `title`, `author`, `description`, `publisher`, `year`, `language`, `isbn`,
+  `tags`, `series`, `series_index`, `cover_url`.  Only provided fields are
+  updated (partial payload supported).
+
+- `GET /api/libraries` — returns list of `{id, name, icon, is_public, ...}`.
+
+- `GET /api/book-types` — returns list of `{id, slug, label, library_id, ...}`.
+
+- `PUT /api/books/{book_id}` — body: any BookUpdate fields.  Use for
+  post-upload corrections.
+
+- Auth header for all requests: `Authorization: Bearer <token>` where token
+  was created in Tome → Settings → API Tokens.
+
+- `GET /api/series/{name}/meta` — returns `{series_name, status}`.  Never
+  404s; returns `status: "unknown"` if no row exists yet.
+
+- `PUT /api/series/{name}/meta` — admin only.  Body `{"status": "ongoing"|"finished"|"hiatus"|"unknown"}`.
+  Returns the updated meta object.
+
+- `GET /api/series/{name}/arcs` — returns list of arcs sorted by `start_index`.
+  Each arc: `{id, series_name, name, start_index, end_index, description, created_at, updated_at}`.
+
+- `POST /api/series/{name}/arcs/bulk` — admin only.  Body is an array of arc
+  objects.  Diffs against existing by `name` field: same name = update, name
+  absent from payload = delete, new names = create.  Returns the new canonical
+  arc list.
+
+**Mismatch with original spec:** The spec described `POST /api/books/fetch-metadata`
+(standalone, no book_id).  That endpoint does not exist.  The actual endpoint
+is `GET /api/books/{book_id}/fetch-metadata`, so books must be ingested before
+metadata can be fetched.  Scribe's workflow reflects this: ingest first, then
+fetch metadata against the created book_id.
+
+---
+
+## Update mode — `/scribe update <query>`
+
+Refresh metadata on books that already exist in Tome.  Works on any subset of
+the library: a single book, a whole series, all books of a given type, etc.
+
+### Trigger forms
+
+- "check metadata for tarzan"
+- "check metadata for all burroughs books"
+- "can you quickly check all novel volumes"
+- "update descriptions for books in my Classics library"
+- "refresh metadata for book 271"
+
+The free-text query is natural language.  Parse the intent, do not require the
+user to know API param names.
+
+Profile selection (Step 0d) applies before any API call is made.
+
+---
+
+### Step U1 — Interpret the query
+
+Map natural language to `GET /api/books` filter params.  Verified param names
+(from `backend/api/books.py`):
+
+| Phrase | Param used |
+|--------|-----------|
+| "X series" / "all X books" | `series=X` (exact match) |
+| "books by X" / "X books" (no series context) | `author=X` |
+| "book 271" / "book id 271" | skip GET — fetch `GET /api/books/271` directly |
+| free text (title keyword) | `q=<text>` |
+| "books in library Y" | resolve `library_id` via `GET /api/libraries`, then `library_id=<id>` |
+| "manga" / "comics" / "novels" | **no `book_type_id` filter exists on `GET /api/books`** — instead use `q=<type label>` or look up the book type's associated `library_id` via `GET /api/book-types` and filter by that |
+| "added by X" | `added_by=<user_id>` (admin only) |
+
+All `GET /api/books` calls use `$URL` and `$TOKEN` from the selected profile.
+
+**Fallback chain for ambiguous series/author queries:**
+
+1. Try `series=<query>` — if results come back, use them.
+2. If no results, try `author=<query>`.
+3. If still nothing, try `q=<query>` (full-text).
+4. If still nothing, ask the user once for clarification.
+
+**Type-label resolution:** `GET /api/book-types` returns `{id, slug, label, library_id}`.
+If the user says "manga volumes" or "light novels", find the matching book type
+by `slug` or `label`, then use its `library_id` as the `library_id` filter param.
+This is the correct workaround since `book_type_id` is not a filter param on
+`GET /api/books`.
+
+If the query is genuinely ambiguous after exhausting the above (e.g. "burroughs"
+could be a series name or an author name), ask once before querying.
+
+---
+
+### Step U2 — Confirm scope
+
+After the GET, print a terse summary and wait for confirmation if more than
+3 books matched:
+
+```
+Found 24 books in series 'Tarzan' by Edgar Rice Burroughs. Fetch candidates and review updates?
+```
+
+If 1-3 books matched, skip the confirmation and proceed directly.
+
+---
+
+### Step U3 — Sibling context (series queries only)
+
+If the query targeted a specific series (i.e. `series=<name>` was used), apply
+the same sibling-pinning logic as Step 4b of the ingest workflow:
+
+- Extract `author`, `series`, `book_type_id`, `library_ids`, and
+  `title_template` from the existing books in the result set (lowest
+  `series_index` first).
+- Use these as `pinned_fields` when scoring and applying candidates.
+
+For heterogeneous queries (full-text, author-only, library-wide), skip sibling
+pinning — books are processed individually without cross-book constraints.
+
+---
+
+### Step U4 — Per-book fetch and score
+
+After fetching candidates, apply the **web fallback for missing descriptions**
+(defined above in the ingest section) for any book whose top candidate has a
+null, empty, or sub-200-character description.
+
+For each matched book, call:
+
+```bash
+curl -sf -H "Authorization: Bearer $TOKEN" \
+  "$URL/api/books/<book_id>/fetch-metadata" \
+  > /tmp/scribe_update_<book_id>.json
+```
+
+Score candidates using the **candidate scoring heuristic** (defined above in
+the ingest workflow — do not redefine it here, use exactly the same table).
+Apply pinned fields from Step U3 where available.
+
+Write a state file at `~/.cache/tome-scribe/.scribe-update-<profile>-<timestamp>.json`
+(create `~/.cache/tome-scribe/` if missing) after each book fetch so the run
+is resumable on Ctrl-C.  Including `<profile>` in the filename ensures that a
+resume attempt only picks up state files for the currently-active profile —
+files for other profiles are ignored.
+
+State file schema (update variant):
+
+```json
+{
+  "mode": "update",
+  "profile": "<active profile name>",
+  "query": "<original user query>",
+  "run_at": "ISO timestamp",
+  "books": [
+    {
+      "book_id": 42,
+      "title": "Tarzan, Vol. 1",
+      "status": "pending|fetched|applied|skipped|error",
+      "chosen_candidate_index": null,
+      "pinned_fields": null,
+      "diff": null,
+      "error": null
+    }
+  ]
+}
+```
+
+**Resume:** on start, check `~/.cache/tome-scribe/` for any
+`.scribe-update-<profile>-*.json` file (matching the current active profile)
+whose `status` contains at least one `"pending"` or `"fetched"` entry.
+If found, ask:
+`"Found an in-progress update run from <timestamp>. Resume? (yes / start fresh)"`
+Ignore state files belonging to other profiles.
+
+---
+
+### Step U5 — Diff preview
+
+For each book, compute a field-level diff between the **current book state**
+and the top-ranked candidate (with pinned overrides applied).  Omit fields
+that are unchanged.
+
+Present diffs in a compact block — all books together, one entry per book:
+
+```
+#1 Tarzan, Vol. 3  [id=42]
+  description:  (empty) → 512c
+  year:         null → 1914
+  cover:        none → openlibrary.org
+
+#2 Tarzan, Vol. 7  [id=55]
+  title:        "Tarzan v7" → "Tarzan, Vol. 7"   [pinned template]
+  description:  (empty) → 488c
+  tags:          [] → ["adventure", "classic"]
+```
+
+Rules for compact display:
+- `description`: show char count of new value (e.g. `488c`), not the full text.
+- `cover`: show only the domain of the URL (e.g. `openlibrary.org`, `books.google.com`), not the full URL.
+- `title`: if the change is driven by a pinned template, append `[pinned template]`.
+- If a book has no changes (candidate matches current state), show
+  `#N <Title>  [id=X]  — no changes` and exclude it from the apply step.
+
+Then prompt:
+
+```
+42 books — 38 with changes, 4 unchanged. Apply? Options:
+  "accept all" — apply every diff
+  "skip #3" — exclude that book, apply the rest
+  "show #5" — verbose drill-down on book #5's full candidate list
+  "cancel" — discard all without applying
+```
+
+---
+
+### Step U6 — Apply
+
+Parse the user's response:
+
+- `"accept all"` → apply every diff that has changes
+- `"skip #N"` → exclude book N, apply the rest
+- `"show #N"` → print all candidate fields for book N (title, author, year,
+  publisher, description snippet, source, cover URL); do not apply yet; re-prompt
+- `"cancel"` → discard without applying; delete the state file
+
+For each book to apply, use `POST /api/books/{id}/apply-metadata` (with
+`$URL` and `$TOKEN` from the selected profile) with the merged payload
+(candidate fields overwritten by pinned fields, same logic as Step 6 /
+"Respecting pinned fields at apply time" in the ingest workflow).
+
+Print terse progress while applying: `"Applied 1/38... 2/38..."`.
+
+Final report: `"Updated 38. Skipped 4. Errors 0."`
+
+Delete the state file on clean completion.
+
+---
+
+## Audit mode — `/scribe audit [scope]`
+
+Scan the library for books with weak metadata, fetch candidates for the weak
+ones, and apply fixes with user approval.
+
+### Trigger forms
+
+- `/scribe audit` — all books (null/missing fields + series drift)
+- `/scribe audit years [scope]` — publication-year drift check (see "Year-drift audit" subsection below)
+- `/scribe audit editions [scope]` — wrong-edition ISBN check for manga/light-novel libraries (see "Edition audit" subsection below)
+- "audit metadata" / "find books with missing metadata"
+- "audit the manga library" / "audit books in Light Novels"
+- "audit books by X"
+- "audit years", "check publication years", "verify years for tarzan"
+- "audit editions", "check for wrong-edition ISBNs", "is any light novel carrying a manga ISBN"
+
+Narrow scope is parsed with the same natural-language interpretation as
+Update mode Step U1.
+
+Profile selection (Step 0d) applies before any API call is made.
+
+---
+
+### Weak-metadata criteria
+
+A book is **weak** if any of the following are true:
+
+| Field | Weak condition |
+|-------|----------------|
+| `description` | null or empty string |
+| `year` | null |
+| `cover_path` | null or empty string |
+| Series title drift | within a series, titles are inconsistent across books (see drift detection rule below) |
+| Year drift | stored `year` differs from Open Library's `first_publish_year` by more than 3 years (requires fetch — see Year-drift audit below) |
+
+Do **not** flag missing `isbn`, `publisher`, or `subtitle` — these are
+legitimately absent on many books.
+
+---
+
+### Year-drift audit (trigger: `/scribe audit years [scope]`)
+
+**Motivation:** embedded/ingested metadata often has the *edition* or *reprint*
+year, not the *first publication* year.  For a classic like Tarzan, stored
+year might be `2008` (Penguin reprint) when the book was actually first
+published in `1914`.  This matters if we later embed Tome metadata into the
+files on disk — we want the real year baked in.
+
+**Trigger forms:**
+- `/scribe audit years` — check every book
+- `/scribe audit years <scope>` — narrow scope, same natural-language parsing
+  as Update mode Step U1 (series, author, library, free-text)
+- "audit years", "check years for tarzan", "verify publication years in
+  Classics library"
+
+**How year trust works per source:**
+
+| Source | Year field meaning | Trust for first-pub? |
+|--------|--------------------|----------------------|
+| Open Library | `first_publish_year` (already parsed as `year` in the candidate dataclass) | **Authoritative** — use for drift detection |
+| Hardcover | `release_year` (edition, not first-pub) | Not reliable — ignore for drift |
+| Google Books | edition year parsed from `publishedDate` | Not reliable — ignore for drift |
+
+**Detection is fetch-based, not scan-based.**  Unlike null/missing fields,
+year drift cannot be detected from the DB alone — it requires comparing
+stored values against external sources.  So year-drift audit always runs
+`fetch-metadata` on every book in scope, regardless of whether other weak
+criteria apply.
+
+**Procedure:**
+
+1. Resolve scope via the same natural-language parsing as Update mode Step U1.
+   Confirm with the user before fetching if scope has more than ~20 books
+   (time estimate: `ceil(count / 10)` minutes).
+
+2. For each book in scope, call `GET /api/books/<book_id>/fetch-metadata`
+   concurrently (batches of 10).
+
+3. For each response, find the **first Open Library candidate** in the list
+   (identified by `source == "open_library"`).  If no OL candidate exists,
+   mark the book `no_ol_candidate` and move on — do not use Hardcover or
+   Google year for drift.
+
+4. Compare `stored_year` against `ol_candidate.year`:
+   - Both present and `abs(stored - ol) > 3` → **drift**
+   - Stored missing and OL present → **missing year** (normal weak case, not
+     drift — handled by the regular audit flow)
+   - OL missing → `no_signal`, skip
+
+5. Write a state file at `~/.cache/tome-scribe/.scribe-audit-years-<profile>-<timestamp>.json`
+   (same directory convention as other audit/update state files).  Persist
+   after each fetch so the run is resumable.  Schema:
+
+```json
+{
+  "mode": "audit-years",
+  "profile": "<active profile name>",
+  "scope": "<description>",
+  "run_at": "ISO timestamp",
+  "books": [
+    {
+      "book_id": 42,
+      "title": "Tarzan, Vol. 1",
+      "stored_year": 2008,
+      "ol_year": 1912,
+      "delta": 96,
+      "status": "pending|drift|match|no_ol_candidate|no_signal|applied|skipped"
+    }
+  ]
+}
+```
+
+6. Present drift cases in a compact block, grouped by magnitude:
+
+```
+34 books scanned · 8 drift · 22 match · 3 no OL candidate · 1 no signal
+
+Year drift (OL first_publish_year vs. stored):
+  #id=42  "Tarzan, Vol. 1"       2008 → 1912   (Δ 96y)
+  #id=55  "A Princess of Mars"   2011 → 1912   (Δ 99y)
+  #id=71  "The Gods of Mars"     2010 → 1913   (Δ 97y)
+  #id=88  "Sherlock Holmes v3"   1995 → 1892   (Δ 103y)
+  ...
+
+Apply? Options:
+  "accept all"       — update all drift cases
+  "skip #N"          — exclude a specific book
+  "show #N"          — verbose: print all OL candidate fields
+  "threshold 10"     — re-filter to only drift > 10 years (drop noise)
+  "cancel"           — discard without applying
+```
+
+7. On `accept all` or selective apply, use `POST /api/books/{id}/apply-metadata`
+   with `{"year": <ol_year>}` only — **never** pull other fields from the OL
+   candidate here.  This step corrects year only; other fields stay as-is.
+
+8. Final summary:
+   ```
+   Year audit complete. 34 scanned · 8 drift · 7 corrected · 1 skipped · 0 errors
+   ```
+   Delete the state file on clean completion.
+
+**Edge case — ranges and approximate dates:** OL occasionally returns wide
+ranges or centuries for old works (e.g. `first_publish_year: 1605` for a
+modern edition of Don Quixote).  Trust OL in these cases — ancient/classic
+first-pub years are usually correct in OL even if pre-modern.
+
+**Never** auto-apply year corrections without surfacing them.  Even perfect
+confidence requires explicit user approval — same rule as series title
+drift.
+
+---
+
+### Edition audit (trigger: `/scribe audit editions [scope]`)
+
+**Motivation:** older Tome versions auto-applied the top metadata candidate
+blindly, which could write the WRONG edition's identity onto a book — the
+manga adaptation's ISBN (and sometimes publisher/description) on a light
+novel, or vice versa.  A wrong stored ISBN then *monopolises* every later
+fetch (ISBN queries dominate retrieval), so the damage self-perpetuates
+until the ISBN itself is corrected.  This check found and fixed 5 such books
+on a real 560-book library (4 Slime LNs + 1 Black Summoner LN carrying manga
+ISBNs).
+
+**Scope:** books that have an ISBN **and** a book type classifying as
+sequential-art (manga/comics/webtoon-like slugs) or light-novel/prose.
+Resolve `book_type_id → slug` via `GET /api/book-types`.  Books without an
+ISBN or with untyped/other types are skipped.
+
+**Detection is fetch-based** (like year drift): for each book in scope call
+`GET /api/books/<id>/fetch-metadata` in batches of 4 (external sources are
+rate-limited; if the response carries `sources` with `"hardcover":
+"rate_limited"`, pause 60 s and retry that book — do not classify a
+rate-limited response).  Handle both response shapes: newer servers return
+`{"candidates": [...], "sources": {...}}`, older ones a bare list.
+
+Classify by finding the candidate whose `isbn` equals the stored ISBN:
+
+| Observation | Status |
+|-------------|--------|
+| Stored-ISBN candidate title contains `(Manga)` but the book type is light-novel/prose | **wrong_edition** |
+| Stored-ISBN candidate title contains `(Light Novel)` but the book type is sequential-art | **wrong_edition** |
+| Stored-ISBN candidate matches the book's edition class | match |
+| No candidate carries the stored ISBN | no_signal |
+| Stored-ISBN candidate has no edition label in its title | unlabelled (fine — most single-edition series are unlabelled) |
+
+**Correction:** the same fetch response usually already contains the right
+edition (newer servers bias retrieval toward the book's edition when the
+stored ISBN looks suspect).  Pick the top candidate that (a) does NOT
+violate the edition class and (b) matches the volume (`series_index`
+equal).  Propose a patch of `isbn` (always) plus `publisher`, `year` and
+`description` from that candidate — the old auto-apply usually poisoned
+those too.  Do NOT touch title, series or cover (covers were typically
+corrected by hand long ago; check before clobbering).
+
+State file: `~/.cache/tome-scribe/.scribe-audit-editions-<profile>-<timestamp>.json`,
+same conventions as the year audit (persist per fetch, resumable, delete on
+clean completion).
+
+Present findings compactly and require explicit approval, same options as
+the year audit (`accept all` / `skip #N` / `show #N` / `cancel`):
+
+```
+333 books scanned · 5 wrong edition · 60 match · 251 unlabelled · 17 no signal
+
+Wrong-edition ISBNs:
+  #id=54  "That Time I Got Reincarnated as a Slime" (light_novel, vol 13)
+          stored 9781646510078 → "…(Manga), Vol. 13" [Kodansha Comics]
+          fix    9781975314460 → "…(Light Novel), Vol. 13" [Yen On]
+  ...
+```
+
+On apply, `POST /api/books/{id}/apply-metadata` with only the proposed
+fields.  Re-verify by re-fetching once and confirming the stored-ISBN
+candidate now matches the edition class.
+
+---
+
+### Step A1 — Scope
+
+Default: all books via paginated `GET /api/books`.  Narrow scope using the
+same filter-param mapping as Update mode Step U1.
+
+Before proceeding, confirm scope with the user:
+
+```
+Auditing 347 books in Classics library. This will take ~5 min (one fetch per
+weak book). Continue?
+```
+
+Estimate time as `ceil(weak_book_count / 10)` minutes (assuming ~6 s per
+fetch, 10 concurrent).  You don't know the weak count yet at this stage, so
+use total book count as an upper bound.
+
+---
+
+### Step A2 — Scan pass (cheap — no API fetches)
+
+Paginate through all books in scope using `GET /api/books?skip=<N>&limit=200`
+(using `$URL` and `$TOKEN` from the selected profile).
+For each book, classify as weak or strong based on the criteria above.  No
+`fetch-metadata` calls in this pass.
+
+**Series title-drift detection:** as you paginate, build a per-series map:
+```
+series_name → {title_pattern: count}
+```
+Where `title_pattern` is the book title with the series index replaced by `N`
+(e.g. `"Tarzan, Vol. 3"` → `"Tarzan, Vol. N"`).  After all pages are
+read, apply the **drift detection rule** (defined once here; referenced from
+Step A5 and sibling-lookup Step 4b / Step U3):
+
+**Case A — clear majority (≥80%):** if the top pattern covers ≥80% of books
+in the series and ≥1 book deviates, mark the outliers as weak with reason
+`"series title drift"`.  The majority pattern is the suggested canonical form.
+
+**Case B — no majority, but inconsistent:** if no single pattern reaches 80%
+(e.g. all three books use different separators or number formats), yet the
+titles are clearly inconsistent (differing separators like `/`, `,`, ` `;
+differing number tokens like `v`, `Vol.`, `Volume`, `#`; or mixed
+zero-padding), mark **all** books in the series as weak with reason
+`"series title drift — no majority"` and supply a suggested canonical format
+based on `book_type`:
+- `book_type` comics or graphic_novel → suggest `"<Series>, Vol. <N>"`
+- `book_type` book with series_index → suggest `"<Series>, Vol. <N>"`
+- `book_type` book (novels, non-series standalones) → do not auto-suggest;
+  ask the user what pattern to use
+- Unknown / mixed → ask the user
+
+**Case C — all consistent:** all books share the same pattern; no action.
+
+The rule applies to series with ≥3 books.  For series with 2 books, only
+flag if the two titles use clearly incompatible formats (e.g. one uses `Vol.`
+and the other uses `/`).
+
+Exploit the existing `missing` filter param to accelerate the scan:
+
+```bash
+# Books missing cover
+curl -sf -H "Authorization: Bearer $TOKEN" \
+  "$URL/api/books?missing=cover&limit=200&skip=0"
+
+# Books missing description
+curl -sf -H "Authorization: Bearer $TOKEN" \
+  "$URL/api/books?missing=description&limit=200&skip=0"
+```
+
+Run these concurrently to build the weak set faster.  For year (null), there
+is no `missing=year` param — paginate normally and filter client-side.
+
+**Critical gotcha — do NOT compute "missing description" from list responses.**
+`GET /api/books` returns `BookOut`, which **omits the `description` field
+entirely**.  If you iterate the list and check `item.get('description')`, every
+book will look empty and you will report "N / N missing description" — a false
+positive across the whole scope.  Always use `?missing=description` for this
+signal, or fetch individual books via `GET /api/books/{id}` (which returns
+`BookDetailOut` with the field populated).  The same applies to any other
+`BookDetailOut`-only fields — prefer the `missing=*` filters for scan-time checks.
+
+---
+
+### Step A3 — Report before fetching
+
+Print a summary of what the scan found, then ask for confirmation before any
+`fetch-metadata` calls:
+
+```
+347 books scanned
+  · 42 missing description
+  · 18 missing year
+  · 31 no cover
+  · 6 series title drift
+  68 unique weak books (some weak in multiple fields)
+
+Proceed with candidate fetch on 68 weak books?
+```
+
+A book is counted once in the "unique weak books" total even if weak in
+multiple fields.
+
+Series title-drift cases are listed separately after the main counts.  Show
+which drift case applies (A = clear majority, B = no majority):
+
+```
+Series title drift detected:
+  "Tarzan"           [Case A] — 10 books use "Tarzan, Vol. N"; 1 uses "Tarzan vN"
+  "Sherlock Holmes"  [Case A] — 8 books use "Sherlock Holmes Vol. N"; 2 use "Sherlock Holmes v N"
+  "Barsoom"          [Case B] — 3 inconsistent patterns; suggested canonical: "Barsoom, Vol. N"
+```
+
+---
+
+### Step A4 — Fetch, diff, apply
+
+For each unique weak book, run the same fetch + score + diff loop as Update
+mode Steps U4 and U5.  For books flagged as weak due to a missing or empty
+description, apply the **web fallback for missing descriptions** (defined in
+the ingest section) if the top fetch-metadata candidate's description is also
+null, empty, or shorter than 200 characters.
+
+Write a state file at `~/.cache/tome-scribe/.scribe-audit-<profile>-<timestamp>.json`
+(same directory as update state files; create if missing) and persist after
+each fetch so the run is resumable.  Including `<profile>` in the filename
+ensures that resume checks only surface files for the currently-active profile.
+
+State file schema (audit variant):
+
+```json
+{
+  "mode": "audit",
+  "profile": "<active profile name>",
+  "scope": "<description of scope>",
+  "run_at": "ISO timestamp",
+  "total_scanned": 347,
+  "weak_book_ids": [42, 55, 71],
+  "books": [
+    {
+      "book_id": 42,
+      "title": "Tarzan Vol. 1",
+      "weak_reasons": ["no description", "no year"],
+      "status": "pending|fetched|applied|skipped|error",
+      "chosen_candidate_index": null,
+      "diff": null,
+      "error": null
+    }
+  ]
+}
+```
+
+**Resume:** on start, check `~/.cache/tome-scribe/` for any
+`.scribe-audit-<profile>-*.json` file (matching the current active profile)
+with pending/fetched entries.  If found, offer to resume before re-scanning.
+Ignore state files belonging to other profiles.
+
+Stream progress while fetching:
+
+```
+Processing 1/68... 2/68... 3/68...
+```
+
+After all fetches complete, show the same compact diff format as Update mode
+Step U5.  Then prompt for bulk resolution with the same option syntax
+(`"accept all"`, `"skip #N"`, `"show #N"`, `"cancel"`).
+
+---
+
+### Step A5 — Series title drift (always surface for review, never auto-apply)
+
+Title drift is handled separately from the main apply step, regardless of
+candidate confidence scores.  Even a perfect confidence score does not
+auto-apply a title change.
+
+After the main apply step, present drift cases one at a time.  For Case A
+(clear majority), show only the outliers.  For Case B (no majority), show
+every book in the series alongside the suggested canonical form; let the user
+accept, edit, or skip:
+
+Case A example:
+```
+Series 'Sherlock Holmes' [Case A] — 8 books use "Sherlock Holmes Vol. N"; 2 use "Sherlock Holmes v N"
+Outliers:
+  #id=71  "Sherlock Holmes v 2"  → normalize to "Sherlock Holmes Vol. 2"?
+  #id=83  "Sherlock Holmes v 5"  → normalize to "Sherlock Holmes Vol. 5"?
+Normalize these outliers? [y/n/show]
+```
+
+Case B example:
+```
+Series 'Barsoom' [Case B] — 3 inconsistent patterns (no majority)
+Suggested canonical: "Barsoom, Vol. N"  (series convention)
+All books:
+  #id=10  "Barsoom /1"    → "Barsoom, Vol. 1"
+  #id=11  "Barsoom/2"     → "Barsoom, Vol. 2"
+  #id=12  "Barsoom/3"     → "Barsoom, Vol. 3"
+Accept suggested pattern, edit it, or skip? [accept/edit <new pattern>/skip]
+```
+
+If the user chooses `edit <new pattern>`, substitute that pattern for all
+books in the series (replacing `N` with each book's `series_index`).
+
+Never auto-apply in either case — always wait for explicit user confirmation.
+
+- `y` → apply via `PUT /api/books/{id}` with `{"title": "<normalized>"}` for
+  each outlier (using `$URL` and `$TOKEN` from the selected profile).
+- `n` → skip this series, move to next.
+- `show` → print all book titles in the series for context, then re-prompt.
+
+Use `PUT /api/books/{id}` (not `apply-metadata`) for title-only corrections,
+since `apply-metadata` triggers a full metadata merge and may overwrite other
+fields.
+
+---
+
+### Step A6 — Final summary
+
+```
+Audit complete. 347 scanned · 68 weak · 51 updated · 12 skipped · 5 errors
+Series drift: 3 series normalized, 1 skipped.
+```
+
+Delete the state file on clean completion.
+
+---
+
+## Step S — `/scribe series <name>` — series metadata
+
+Fill series-level metadata — publication status and story arcs — from Claude's
+own knowledge.  A required confirm-diff step precedes every write.
+
+### Trigger forms
+
+- `/scribe series Berserk`
+- `/scribe series "A Certain Magical Index"`
+- "fill arcs for berserk"
+- "set series status for One Piece"
+- "add arc data to the Berserk series"
+
+Profile selection (Step 0d) applies before any API call is made.
+
+---
+
+### Step S1 — Resolve the series
+
+Parse the series name out of the command (strip quotes if present).
+URL-encode the name for use in API calls.
+
+Confirm the series exists in the library and gather its volumes:
+
+```bash
+curl -sf -H "Authorization: Bearer $TOKEN" \
+  "$URL/api/books?series=<url-encoded-name>&limit=500" \
+  > /tmp/scribe_series_books.json
+```
+
+Extract the list of `{id, title, series_index}` from the response.
+Sort by `series_index` ascending.
+
+If zero books are returned, abort:
+`"No books found for series '<name>'. Check the series name and try again."`
+
+Print nothing else at this stage.
+
+---
+
+### Step S2 — Read existing metadata
+
+Fetch current series state in parallel:
+
+```bash
+# Meta (status)
+curl -sf -H "Authorization: Bearer $TOKEN" \
+  "$URL/api/series/<url-encoded-name>/meta" \
+  > /tmp/scribe_series_meta.json
+
+# Arcs
+curl -sf -H "Authorization: Bearer $TOKEN" \
+  "$URL/api/series/<url-encoded-name>/arcs" \
+  > /tmp/scribe_series_arcs.json
+```
+
+Record `existing_status` (from meta) and `existing_arcs` (from arcs, may be
+an empty list).
+
+---
+
+### Step S3 — Handle existing arcs
+
+If `existing_arcs` is non-empty, prompt the user before generating a proposal:
+
+```
+This series already has N arc(s):
+  #1  <arc name>  Vol. <start>–<end>
+  ...
+Replace all / merge (keep existing, add proposed as new names only) / abort?
+```
+
+Wait for the user's choice before continuing.
+
+- **Replace all** — the proposal will replace every existing arc.
+- **Merge** — existing arcs are carried through verbatim into the payload; the
+  proposal only adds arcs whose names do not already exist.  Because
+  `POST /api/series/{name}/arcs/bulk` deletes any arc absent from the payload,
+  merge mode must include existing entries unchanged alongside any new ones.
+- **Abort** — print `"Aborted. No changes written."` and stop.
+
+If `existing_arcs` is empty, skip this step entirely.
+
+---
+
+### Step S4 — LLM proposal
+
+Claude generates a proposal from its own knowledge of the series.  No external
+API calls are made at this step.
+
+Required shape:
+```json
+{
+  "status": "ongoing" | "finished" | "hiatus" | "unknown",
+  "arcs": [
+    {
+      "name": "Arc Name",
+      "start_index": 1.0,
+      "end_index": 2.0,
+      "description": "One short sentence or null."
+    }
+  ]
+}
+```
+
+Rules:
+
+- **Confidence gate:** if Claude does not have confident, specific knowledge of
+  this series (cannot name at least the major arcs and their approximate volume
+  ranges), refuse and stop:
+  `"I don't have confident knowledge of '<name>' — please add arcs manually via the Tome UI."`
+  Do not attempt a partial or guessed proposal.
+- `status: "unknown"` is acceptable when the current publication state is
+  genuinely unclear.
+- `arcs` may be an empty array `[]` only if the series is a standalone work
+  with no distinct story arcs.  If this is the case, state it explicitly:
+  `"<name> has no distinct arcs — only status will be set."` and show the
+  status diff only (Step S5).
+- Arc `start_index` and `end_index` must be floats matching Tome's
+  `series_index` type (e.g. `1.0`, `13.5`).
+- Descriptions: one sentence, under 200 characters.  Describe the arc's
+  premise without spoiling major plot resolutions.  Use `null` if no neutral
+  one-sentence summary is possible.
+
+Do not print the proposal JSON.  Proceed to Step S5.
+
+---
+
+### Step S5 — Present diff
+
+Render the proposal side-by-side with existing state in a compact, human-readable
+block:
+
+```
+Series: Berserk
+Status:   unknown → ongoing
+
+Arcs (new):
+  #1  Black Swordsman      Vol. 1.0–2.0    Guts' lone hunts for apostles.
+  #2  Golden Age           Vol. 3.0–14.0   Flashback: origin of the Band of the Hawk.
+  #3  Conviction           Vol. 14.0–21.0  Guts' journey through a war-torn land.
+  #4  Falcon of the Millennium Empire  Vol. 22.0–35.0  Griffith reborn and war on two fronts.
+  #5  Fantasia             Vol. 35.0–41.0  The world transformed; Guts' final pursuit.
+```
+
+If Step S3 was "merge", label the section:
+```
+Arcs (merged — existing kept, additions shown with *):
+  #1  Black Swordsman  Vol. 1.0–2.0   [existing]
+  #2  Golden Age       Vol. 3.0–14.0  [existing]
+  #3  Lost Children    Vol. 14.0–17.0 * (new)
+```
+
+**Mismatch / gap flags (print below the arc list; do not abort):**
+
+- If the proposal's maximum `end_index` is less than the library's maximum
+  `series_index`, list the unaccounted volumes:
+  `"Library has Vol. up to X; proposal ends at Y — unassigned: Vol. Z1, Z2, ..."`
+- If any library `series_index` value falls between two arc ranges (a gap) or
+  beyond the last arc:
+  `"Vol. X.5 is in the library but falls outside all proposed arcs."`
+- These warnings are informational only.  The user decides whether to adjust.
+
+If `status` is unchanged (existing equals proposed), omit the Status line.
+If arcs is empty (standalone work), omit the Arcs block entirely.
+
+---
+
+### Step S6 — Confirm and apply
+
+After the diff, prompt:
+
+```
+Apply? ("yes"/"apply", row-level correction, or "no"/"abort")
+```
+
+**"yes" / "apply":**
+
+1. Write status:
+```bash
+curl -sf -X PUT "$URL/api/series/<url-encoded-name>/meta" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"status": "<proposed_status>"}'
+```
+
+2. Write arcs (skip if arcs array is empty):
+```bash
+curl -sf -X POST "$URL/api/series/<url-encoded-name>/arcs/bulk" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '<arcs array JSON>'
+```
+
+   In merge mode, include existing arcs verbatim in the array alongside any
+   new ones, so the bulk endpoint does not delete them.
+
+3. On HTTP 403 for either call: `"Permission denied — the active token is not
+   admin. No changes written."` and stop.
+
+4. On success, print one line:
+   `"Applied: status=<status>, <N> arcs."`
+   (If only status was changed and arcs were empty: `"Applied: status=<status>."`)
+
+**Row-level correction** — the user modifies the proposal in natural language
+before applying.  Examples:
+- `"change arc 3 end to 20"` → update `end_index` on arc #3 in the in-memory
+  proposal
+- `"drop arc 5"` → remove arc #5 from the proposal
+- `"rename #2 to Lost Children Arc"` → update `name` on arc #2
+- `"set start of arc 4 to 22.5"` → update `start_index` on arc #4
+
+Parse the correction, update the in-memory proposal, re-render only the changed
+rows plus a one-line summary of what changed, then re-prompt for confirmation:
+
+```
+Updated arc #3: end_index 14.0 → 20.0
+Re-confirm? ("yes"/"apply", further corrections, or "no"/"abort")
+```
+
+Corrections may be chained — keep accepting corrections and re-prompting until
+the user says "yes"/"apply" or "no"/"abort".
+
+**"no" / "abort":**
+`"Aborted. No changes written."` and stop.
+
+---
+
+### Cross-cutting rules for series mode
+
+- **Output discipline:** terse throughout.  Never echo the proposal JSON.
+  The diff in Step S5 is the only substantive human-readable output.  All other
+  messages are one-line status, prompts, or warnings.
+- **Writes require admin.** A 403 from either write endpoint must be surfaced
+  cleanly as `"Permission denied — the active token is not admin."` — do not
+  retry or fall back silently.
+- **Step S3 merge invariant:** when merge mode is active, the arcs payload
+  sent to `POST .../arcs/bulk` must always contain the full set of arcs that
+  should exist after the call — existing arcs included verbatim, new arcs
+  appended.  Never send a partial payload in merge mode.
+- **No state file for series mode.** The workflow is interactive and short
+  enough that a crash-resumable state file adds complexity without benefit.
+  If something goes wrong, the user simply re-runs `/scribe series <name>`.
+
+---
+
+## Shared conventions for update and audit modes
+
+- Both modes use the **candidate scoring heuristic** table defined above (in
+  the ingest section) without modification.  Do not redefine or adjust the
+  scoring at runtime.
+- Both modes use the **pinned-fields logic** from Step 4b and "Respecting
+  pinned fields at apply time" (Step 6) in the ingest workflow.
+- Both modes use the same **output discipline**: terse by default; verbose
+  drill-down only on explicit user request ("show #N", "verbose").
+- State files for both modes live in `~/.cache/tome-scribe/` (create if
+  missing).  They are **not** placed in any book directory or the Tome data
+  dir.
+- `book_type_id` is **not** a filter param on `GET /api/books`.  To narrow by
+  book type, resolve the type's `library_id` from `GET /api/book-types` and
+  use `library_id=<id>` instead.
+- Title-only corrections (drift normalization) use `PUT /api/books/{id}` with
+  a body containing just `{"title": "<new>"}`.  Field-level metadata updates
+  (description, year, cover, tags, etc.) use
+  `POST /api/books/{id}/apply-metadata`.
+
+---
+
+## Error handling reminders
+
+- If `extract.py` exits non-zero, show stderr and stop.
+- If Tome returns 401 on any call, tell the user their token may be expired
+  or wrong, and offer to re-run Step 0 for the active profile.
+- If a single ingest call fails with a non-409 error, log it and continue —
+  never abort the batch.
+- If `/tmp` fills up, warn and stop before corrupting state.

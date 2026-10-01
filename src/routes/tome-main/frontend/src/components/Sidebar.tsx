@@ -1,0 +1,1348 @@
+import { Fragment, useState, useRef, useEffect, useMemo } from 'react'
+import { useSearchParams, useLocation, useNavigate, Link } from 'react-router-dom'
+import * as LucideIcons from 'lucide-react'
+import {
+  BookOpen, Plus, Pencil, Share2, Trash2,
+  ChevronLeft, ChevronRight, Bookmark, Library as LibraryIcon, Layers, Home, BarChart3,
+  Settings, Shield, LogOut, ChevronsUpDown, Lock, X, BookPlus, ExternalLink,
+  Sun, Moon, MoonStar, Flame, Coffee, Check, Sparkles, Users, Quote, BookMarked,
+  type LucideIcon,
+} from 'lucide-react'
+import { api } from '@/lib/api'
+import { ShareModal } from '@/components/ShareShelfModal'
+import type { Library, SavedFilter } from '@/lib/books'
+import { cn } from '@/lib/utils'
+import { EntityModal } from '@/components/EntityModal'
+import { TomeMark } from '@/components/TomeMark'
+import { useAuth, isAdmin, isMember } from '@/contexts/AuthContext'
+import { applyTheme, getStoredTheme, type ThemeId } from '@/lib/theme'
+import { DOCS, docsLink } from '@/lib/docs'
+import { Trans, useLingui } from '@lingui/react/macro'
+import { msg } from '@lingui/core/macro'
+import type { MessageDescriptor } from '@lingui/core'
+
+const SIDEBAR_KEY = 'tome_sidebar'
+
+function isLucideIcon(val: unknown): val is LucideIcon {
+  return typeof val === 'object' && val !== null && 'render' in val
+}
+
+export const ICON_MAP: Record<string, LucideIcon> = Object.fromEntries(
+  Object.entries(LucideIcons).filter(
+    ([name, val]) => /^[A-Z]/.test(name) && isLucideIcon(val) && !name.endsWith('Icon')
+  ) as [string, LucideIcon][]
+)
+
+export function getIcon(name?: string | null, className = 'w-3.5 h-3.5') {
+  const Comp = ICON_MAP[name ?? ''] ?? LibraryIcon
+  return <Comp className={className} />
+}
+
+const ALL_ICONS: [string, LucideIcon][] = Object.entries(LucideIcons).filter(
+  ([name, val]) => /^[A-Z]/.test(name) && isLucideIcon(val) && !name.endsWith('Icon')
+) as [string, LucideIcon][]
+
+export function IconPicker({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const { t } = useLingui()
+  const [open, setOpen] = useState(false)
+  const [search, setSearch] = useState('')
+  const ref = useRef<HTMLDivElement>(null)
+  const searchRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    setTimeout(() => searchRef.current?.focus(), 0)
+    function onDown(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [open])
+
+  const filtered = useMemo(() => {
+    const q = search.toLowerCase()
+    const results = q ? ALL_ICONS.filter(([name]) => name.toLowerCase().includes(q)) : ALL_ICONS
+    return results.slice(0, 96)
+  }, [search])
+
+  const Curr = (ICON_MAP[value] ?? LibraryIcon) as LucideIcon
+  return (
+    <div className="relative shrink-0" ref={ref}>
+      <button
+        type="button"
+        onClick={() => { setOpen(o => !o); setSearch('') }}
+        className="flex items-center justify-center w-7 h-7 rounded-md border border-border bg-muted hover:bg-muted/80 text-muted-foreground hover:text-foreground transition-colors"
+        title={t`Choose icon`}
+        aria-label={t`Choose icon`}
+      >
+        <Curr className="w-3.5 h-3.5" />
+      </button>
+      {open && (
+        <div className="absolute left-0 top-full mt-1 z-50 bg-card border border-border rounded-xl shadow-xl shadow-accent-soft p-2 w-72">
+          <input
+            ref={searchRef}
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder={t`Search icons…`}
+            className="w-full mb-2 px-2 py-1 text-xs rounded-md border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring"
+          />
+          <div className="grid grid-cols-8 gap-1 max-h-[300px] overflow-y-auto">
+            {filtered.map(([name, Comp]) => (
+              <button
+                key={name}
+                type="button"
+                onClick={() => { onChange(name); setOpen(false) }}
+                className={cn(
+                  'flex items-center justify-center w-7 h-7 rounded hover:bg-muted transition-colors',
+                  value === name && 'bg-primary/15 text-primary'
+                )}
+                title={name}
+              >
+                <Comp className="w-3.5 h-3.5" />
+              </button>
+            ))}
+          </div>
+          {!search && <p className="text-[10px] text-muted-foreground text-center mt-1.5"><Trans>Search to find more icons</Trans></p>}
+        </div>
+      )}
+    </div>
+  )
+}
+
+interface Props {
+  libraries: Library[]
+  savedFilters: SavedFilter[]
+  // 'none' = a non-dashboard page (Stats/Highlights/…) is open, so none of the
+  // Home/All Books/Series items highlight — the active route item does instead.
+  activeTab: 'home' | 'books' | 'series' | 'none'
+  onLibrariesChange: () => void
+  onSavedFiltersChange: () => void
+  onOpenSeriesView: () => void
+  onOpenHomeView: () => void
+  mobileOpen: boolean
+  onMobileClose: () => void
+}
+
+export function Sidebar({ libraries, savedFilters, activeTab, onLibrariesChange, onSavedFiltersChange, onOpenSeriesView, onOpenHomeView, mobileOpen, onMobileClose }: Props) {
+  const { t } = useLingui()
+  const [open, setOpen] = useState(() => localStorage.getItem(SIDEBAR_KEY) !== 'closed')
+  const [searchParams] = useSearchParams()
+  const navigate = useNavigate()
+  const { user, logout } = useAuth()
+
+  // Generic filter modal (for saved filters only)
+  const [modalOpen, setModalOpen] = useState(false)
+  const [modalTitle, setModalTitle] = useState('')
+  const [modalInitialName, setModalInitialName] = useState('')
+  const [modalInitialIcon, setModalInitialIcon] = useState('')
+  const [modalDefaultIcon, setModalDefaultIcon] = useState('Library')
+  const [modalOnSave, setModalOnSave] = useState<(name: string, icon: string) => Promise<void>>(() => async () => {})
+
+  // Library modal (with is_public)
+  const [libModalOpen, setLibModalOpen] = useState(false)
+  const [libModalTitle, setLibModalTitle] = useState('')
+  const [libModalOnSave, setLibModalOnSave] = useState<(name: string, icon: string, isPublic: boolean) => Promise<void>>(() => async () => {})
+  const [libModalInitialName, setLibModalInitialName] = useState('')
+  const [libModalInitialIcon, setLibModalInitialIcon] = useState('Library')
+  const [libModalInitialPublic, setLibModalInitialPublic] = useState(true)
+  const [libModalLibraryId, setLibModalLibraryId] = useState<number | null>(null)
+  const [libModalAssignedIds, setLibModalAssignedIds] = useState<number[]>([])
+
+  const location = useLocation()
+
+  // Close mobile drawer on navigation
+  useEffect(() => {
+    onMobileClose()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.pathname, location.search])
+
+  // Lock body scroll when mobile drawer is open
+  useEffect(() => {
+    document.body.style.overflow = mobileOpen ? 'hidden' : ''
+    return () => { document.body.style.overflow = '' }
+  }, [mobileOpen])
+
+  const [binderyCount, setBinderyCount] = useState(0)
+  const prevCountRef = useRef(0)
+  const [badgePulse, setBadgePulse] = useState(false)
+
+  useEffect(() => {
+    if (!isAdmin(user)) return
+    const fetchCount = () => {
+      api.get<{ count: number }>('/bindery/count')
+        .then(d => setBinderyCount(d.count))
+        .catch(() => {})
+    }
+    fetchCount()
+    const interval = setInterval(fetchCount, 30_000)
+    return () => clearInterval(interval)
+  }, [user])
+
+  useEffect(() => {
+    if (binderyCount > prevCountRef.current) {
+      setBadgePulse(true)
+      setTimeout(() => setBadgePulse(false), 1000)
+    }
+    prevCountRef.current = binderyCount
+  }, [binderyCount])
+
+  const activeLibrary = searchParams.get('library_id') ? Number(searchParams.get('library_id')) : null
+  const activeSavedFilter = searchParams.get('saved_filter') ? Number(searchParams.get('saved_filter')) : null
+  const isHomeTab = activeTab === 'home'
+  const isAllBooks = !activeLibrary && !activeSavedFilter && activeTab === 'books'
+  const isSeriesTab = activeTab === 'series'
+
+  function toggleOpen() {
+    const next = !open
+    setOpen(next)
+    localStorage.setItem(SIDEBAR_KEY, next ? 'open' : 'closed')
+  }
+
+  // Navigate to the dashboard (pathname '/') with these params. Using navigate
+  // (not setSearchParams) means these work from a non-dashboard page too — the
+  // sidebar is now shared by Stats/Highlights/… via AppShell. On the dashboard
+  // itself the resulting URL is identical, so behaviour there is unchanged.
+  function goToBooks(params: Record<string, string>) {
+    navigate({ pathname: '/', search: '?' + new URLSearchParams(params).toString() })
+  }
+  function selectAllBooks() { goToBooks({ tab: 'books' }) }
+  function selectLibrary(id: number) { goToBooks({ tab: 'books', library_id: String(id) }) }
+  function selectSavedFilter(sf: SavedFilter) {
+    const params: Record<string, string> = { tab: 'books', saved_filter: String(sf.id) }
+    Object.entries(sf.params).forEach(([k, v]) => { if (v) params[k] = v })
+    goToBooks(params)
+  }
+
+  function openCreateLibModal() {
+    setLibModalTitle(t`New Library`)
+    setLibModalInitialName('')
+    setLibModalInitialIcon('Library')
+    setLibModalInitialPublic(true)
+    setLibModalLibraryId(null)
+    setLibModalAssignedIds([])
+    setLibModalOnSave(() => async (name: string, icon: string, isPublic: boolean) => {
+      await api.post('/libraries', { name, icon, is_public: isPublic })
+      onLibrariesChange()
+    })
+    setLibModalOpen(true)
+  }
+
+  function openEditLibModal(lib: Library) {
+    setLibModalTitle(t`Edit Library`)
+    setLibModalInitialName(lib.name)
+    setLibModalInitialIcon(lib.icon ?? 'Library')
+    setLibModalInitialPublic(lib.is_public ?? true)
+    setLibModalLibraryId(lib.id)
+    setLibModalAssignedIds(lib.assigned_user_ids ?? [])
+    setLibModalOnSave(() => async (name: string, icon: string, isPublic: boolean) => {
+      await api.put(`/libraries/${lib.id}`, { name, icon, is_public: isPublic })
+      onLibrariesChange()
+    })
+    setLibModalOpen(true)
+  }
+
+  const [shareShelf, setShareShelf] = useState<SavedFilter | null>(null)
+
+  function openEditFilterModal(sf: SavedFilter) {
+    setModalTitle(t`Edit Shelf`)
+    setModalInitialName(sf.name)
+    setModalInitialIcon(sf.icon ?? 'Bookmark')
+    setModalDefaultIcon('Bookmark')
+    setModalOnSave(() => async (name: string, icon: string) => {
+      await api.put(`/saved-filters/${sf.id}`, { name, icon })
+      onSavedFiltersChange()
+    })
+    setModalOpen(true)
+  }
+
+
+  return (
+    <>
+      {/* eslint-disable-next-line lingui/no-unlocalized-strings -- CSS, not copy */}
+      <style>{`
+        @keyframes sidebar-jiggle {
+          0%, 100% { transform: rotate(0deg); }
+          20% { transform: rotate(-8deg); }
+          40% { transform: rotate(6deg); }
+          60% { transform: rotate(-4deg); }
+          80% { transform: rotate(2deg); }
+        }
+        .sidebar-item-icon { transition: transform 0.15s ease; }
+        .group:hover .sidebar-item-icon { animation: sidebar-jiggle 0.4s ease-in-out; }
+        @keyframes badge-ping {
+          0% { transform: scale(1); }
+          50% { transform: scale(1.3); }
+          100% { transform: scale(1); }
+        }
+      `}</style>
+      {modalOpen && (
+        <EntityModal
+          title={modalTitle}
+          initialName={modalInitialName}
+          initialIcon={modalInitialIcon}
+          defaultIcon={modalDefaultIcon}
+          onSave={modalOnSave}
+          onClose={() => setModalOpen(false)}
+        />
+      )}
+      {shareShelf && (
+        <ShareModal
+          title={shareShelf.name}
+          endpoint={`/shelves/${shareShelf.id}/share`}
+          noun="shelf"
+          onClose={() => setShareShelf(null)}
+        />
+      )}
+      {libModalOpen && (
+        <LibraryModal
+          title={libModalTitle}
+          initialName={libModalInitialName}
+          initialIcon={libModalInitialIcon}
+          initialIsPublic={libModalInitialPublic}
+          libraryId={libModalLibraryId}
+          initialAssignedIds={libModalAssignedIds}
+          currentUserId={user?.id ?? null}
+          onSave={libModalOnSave}
+          onChanged={onLibrariesChange}
+          onClose={() => setLibModalOpen(false)}
+        />
+      )}
+      <aside className={cn(
+        // Same recede tint as the Home rail — the content column is the page's
+        // one elevated surface, and the nav frames it instead of competing.
+        'hidden md:flex shrink-0 flex-col border-r border-border bg-muted/40 transition-all duration-200',
+        open ? 'w-52' : 'w-10'
+      )}>
+        {!open && (
+          <div className="flex flex-col items-center flex-1 overflow-y-auto py-2 space-y-0.5 overscroll-contain">
+            <button
+              onClick={onOpenHomeView}
+              title={t`Home`}
+              aria-label={t`Home`}
+              className={cn(
+                'group relative flex items-center justify-center w-9 h-9 rounded-lg transition-all',
+                isHomeTab
+                  ? 'bg-primary/10 text-primary'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+              )}
+            >
+              <Home className="w-4 h-4 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+            </button>
+            <button
+              onClick={selectAllBooks}
+              title={t`All Books`}
+              aria-label={t`All Books`}
+              className={cn(
+                'group relative flex items-center justify-center w-9 h-9 rounded-lg transition-all',
+                isAllBooks
+                  ? 'bg-primary/10 text-primary'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+              )}
+            >
+              <BookOpen className="w-4 h-4 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+            </button>
+            <button
+              onClick={onOpenSeriesView}
+              title={t`Series`}
+              aria-label={t`Series`}
+              className={cn(
+                'group relative flex items-center justify-center w-9 h-9 rounded-lg transition-all',
+                isSeriesTab
+                  ? 'bg-primary/10 text-primary'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+              )}
+            >
+              <Layers className="w-4 h-4 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+            </button>
+            <Link
+              to="/stats"
+              title={t`Stats`}
+              aria-label={t`Stats`}
+              className={cn(
+                'group relative flex items-center justify-center w-9 h-9 rounded-lg transition-all',
+                location.pathname === '/stats'
+                  ? 'bg-primary/10 text-primary'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+              )}
+            >
+              <BarChart3 className="w-4 h-4 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+            </Link>
+            <Link
+              to="/highlights"
+              title={t`Highlights`}
+              aria-label={t`Highlights`}
+              className={cn(
+                'group relative flex items-center justify-center w-9 h-9 rounded-lg transition-all',
+                location.pathname === '/highlights'
+                  ? 'bg-primary/10 text-primary'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+              )}
+            >
+              <Quote className="w-4 h-4 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+            </Link>
+            {isMember(user) && (
+              <Link
+                to="/wishlist"
+                title={t`Wishlist`}
+                aria-label={t`Wishlist`}
+                className={cn(
+                  'group relative flex items-center justify-center w-9 h-9 rounded-lg transition-all',
+                  location.pathname === '/wishlist'
+                    ? 'bg-primary/10 text-primary'
+                    : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                )}
+              >
+                <Sparkles className="w-4 h-4 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+              </Link>
+            )}
+            {isAdmin(user) && (
+              <Link
+                to="/bindery"
+                title={t`Bindery`}
+                aria-label={t`Bindery`}
+                className={cn(
+                  'group relative flex items-center justify-center w-9 h-9 rounded-lg transition-all',
+                  location.pathname === '/bindery'
+                    ? 'bg-primary/10 text-primary'
+                    : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                )}
+              >
+                <BookPlus className="w-4 h-4 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+                {binderyCount > 0 && (
+                  <span className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-primary" />
+                )}
+              </Link>
+            )}
+            {libraries.length > 0 && (
+              <div className="w-6 h-px bg-border my-0.5" />
+            )}
+            {libraries.map(lib => (
+              <button
+                key={lib.id}
+                onClick={() => selectLibrary(lib.id)}
+                title={lib.name}
+                aria-label={lib.name}
+                className={cn(
+                  'group relative flex items-center justify-center w-9 h-9 rounded-lg transition-all',
+                  activeLibrary === lib.id
+                    ? 'bg-primary/10 text-primary'
+                    : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                )}
+              >
+                <span className="w-4 h-4 flex items-center justify-center group-hover:animate-[wiggle_0.4s_ease-in-out]">
+                  {getIcon(lib.icon ?? 'Library', 'w-4 h-4')}
+                </span>
+              </button>
+            ))}
+            {savedFilters.length > 0 && (
+              <div className="w-6 h-px bg-border my-0.5" />
+            )}
+            {savedFilters.map(sf => (
+              <button
+                key={sf.id}
+                onClick={() => selectSavedFilter(sf)}
+                title={sf.name}
+                aria-label={sf.name}
+                className={cn(
+                  'group relative flex items-center justify-center w-9 h-9 rounded-lg transition-all',
+                  activeSavedFilter === sf.id
+                    ? 'bg-primary/10 text-primary'
+                    : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                )}
+              >
+                <span className="w-4 h-4 flex items-center justify-center group-hover:animate-[wiggle_0.4s_ease-in-out]">
+                  {getIcon(sf.icon ?? 'Bookmark', 'w-4 h-4')}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {open && (
+          <nav className="flex-1 overflow-y-auto px-2 pt-3 pb-4 space-y-4 overscroll-contain">
+            <div>
+              <button
+                onClick={onOpenHomeView}
+                className={cn(
+                  'group flex items-center gap-2 w-full px-2 py-1.5 rounded-lg text-sm transition-all touch-feedback',
+                  isHomeTab
+                    ? 'bg-primary/10 text-primary font-medium'
+                    : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                )}
+              >
+                <Home className="w-4 h-4 shrink-0 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+                <span className="truncate"><Trans>Home</Trans></span>
+              </button>
+              <button
+                onClick={selectAllBooks}
+                className={cn(
+                  'group flex items-center gap-2 w-full px-2 py-1.5 rounded-lg text-sm transition-all touch-feedback',
+                  isAllBooks
+                    ? 'bg-primary/10 text-primary font-medium'
+                    : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                )}
+              >
+                <BookOpen className="w-4 h-4 shrink-0 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+                <span className="truncate"><Trans>All Books</Trans></span>
+              </button>
+              <button
+                onClick={onOpenSeriesView}
+                className={cn(
+                  'group flex items-center gap-2 w-full px-2 py-1.5 rounded-lg text-sm transition-all touch-feedback',
+                  isSeriesTab
+                    ? 'bg-primary/10 text-primary font-medium'
+                    : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                )}
+              >
+                <Layers className="w-4 h-4 shrink-0 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+                <span className="truncate"><Trans>Series</Trans></span>
+              </button>
+              <Link
+                to="/stats"
+                className={cn(
+                  'group flex items-center gap-2 w-full px-2 py-1.5 rounded-lg text-sm transition-all touch-feedback',
+                  location.pathname === '/stats'
+                    ? 'bg-primary/10 text-primary font-medium'
+                    : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                )}
+              >
+                <BarChart3 className="w-4 h-4 shrink-0 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+                <span className="truncate"><Trans>Stats</Trans></span>
+              </Link>
+              <Link
+                to="/highlights"
+                className={cn(
+                  'group flex items-center gap-2 w-full px-2 py-1.5 rounded-lg text-sm transition-all touch-feedback',
+                  location.pathname === '/highlights'
+                    ? 'bg-primary/10 text-primary font-medium'
+                    : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                )}
+              >
+                <Quote className="w-4 h-4 shrink-0 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+                <span className="truncate"><Trans>Highlights</Trans></span>
+              </Link>
+              {isMember(user) && (
+                <Link
+                  to="/wishlist"
+                  className={cn(
+                    'group flex items-center gap-2 w-full px-2 py-1.5 rounded-lg text-sm transition-all touch-feedback',
+                    location.pathname === '/wishlist'
+                      ? 'bg-primary/10 text-primary font-medium'
+                      : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                  )}
+                >
+                  <Sparkles className="w-4 h-4 shrink-0 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+                  <span className="truncate"><Trans>Wishlist</Trans></span>
+                </Link>
+              )}
+              {isMember(user) && (
+                <Link
+                  to="/hardcover"
+                  className={cn(
+                    'group flex items-center gap-2 w-full px-2 py-1.5 rounded-lg text-sm transition-all touch-feedback',
+                    location.pathname === '/hardcover'
+                      ? 'bg-primary/10 text-primary font-medium'
+                      : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                  )}
+                >
+                  <BookMarked className="w-4 h-4 shrink-0 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+                  <span className="truncate"><Trans>Hardcover</Trans></span>
+                </Link>
+              )}
+              {isAdmin(user) && (
+                <Link
+                  to="/bindery"
+                  className={cn(
+                    'group flex items-center gap-2 w-full px-2 py-1.5 rounded-lg text-sm transition-all touch-feedback',
+                    location.pathname === '/bindery'
+                      ? 'bg-primary/10 text-primary font-medium'
+                      : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                  )}
+                >
+                  <BookPlus className="w-4 h-4 shrink-0 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+                  <span className="truncate"><Trans>Bindery</Trans></span>
+                  {binderyCount > 0 && (
+                    <span
+                      className="ml-auto text-[10px] font-medium bg-primary/15 text-primary px-1.5 py-0.5 rounded-full"
+                      style={{ animation: badgePulse ? 'badge-ping 0.4s ease-in-out' : 'none' }}
+                    >
+                      {binderyCount}
+                    </span>
+                  )}
+                </Link>
+              )}
+            </div>
+
+            <Section
+              title={t`Libraries`}
+              icon={<LibraryIcon className="w-3 h-3" />}
+              onAdd={openCreateLibModal} addLabel={t`New library`}
+            >
+              {libraries.map(lib => (
+                <SidebarItem
+                  key={lib.id}
+                  label={lib.name}
+                  iconName={lib.icon ?? 'Library'}
+                  count={lib.book_count}
+                  active={activeLibrary === lib.id}
+                  isPrivate={lib.is_public === false}
+                  onClick={() => selectLibrary(lib.id)}
+                  onEdit={lib.can_edit ? () => openEditLibModal(lib) : undefined}
+                  onDelete={lib.can_edit ? async () => {
+                    await api.delete(`/libraries/${lib.id}`)
+                    if (activeLibrary === lib.id) selectAllBooks()
+                    onLibrariesChange()
+                  } : undefined}
+                />
+              ))}
+            </Section>
+
+            {savedFilters.length > 0 && (
+              <Section
+                title={t`Shelves`}
+                icon={<Bookmark className="w-3 h-3" />}
+              >
+                {savedFilters.map(sf => (
+                  <SidebarItem
+                    key={sf.id}
+                    label={sf.name}
+                    iconName={sf.icon ?? 'Bookmark'}
+                    active={activeSavedFilter === sf.id}
+                    onClick={() => selectSavedFilter(sf)}
+                    onEdit={() => openEditFilterModal(sf)}
+                    onShare={() => setShareShelf(sf)}
+                    onDelete={async () => {
+                      await api.delete(`/saved-filters/${sf.id}`)
+                      if (activeSavedFilter === sf.id) selectAllBooks()
+                      onSavedFiltersChange()
+                    }}
+                  />
+                ))}
+              </Section>
+            )}
+          </nav>
+        )}
+
+        {/* User profile footer — single trigger, popover on click */}
+        {open && (
+          <UserMenu user={user} logout={logout} onCollapse={toggleOpen} />
+        )}
+        {!open && (
+          <CollapsedUserMenu user={user} logout={logout} onExpand={toggleOpen} />
+        )}
+      </aside>
+
+      {/* Mobile sidebar overlay */}
+      <div className={cn('md:hidden', !mobileOpen && 'pointer-events-none')}>
+          {/* Backdrop */}
+          <div
+            className={cn(
+              'fixed inset-0 z-40 bg-black/50 transition-opacity duration-200',
+              mobileOpen ? 'opacity-100' : 'opacity-0'
+            )}
+            onClick={onMobileClose}
+          />
+          {/* Drawer panel */}
+          <div
+            className={cn(
+              'fixed inset-y-0 left-0 z-50 w-72 flex flex-col border-r border-border bg-card safe-top',
+              mobileOpen ? 'translate-x-0' : '-translate-x-full'
+            )}
+            style={{ transition: 'transform 0.35s var(--spring)' }}
+          >
+            {/* Header with close button */}
+            <div className="flex items-center justify-between px-3 h-14 border-b border-border shrink-0">
+              <div className="flex items-center gap-2 group cursor-default">
+                <TomeMark className="w-5 h-5 text-primary logo-bob" strokeWidth={7} />
+                <span className="font-semibold text-sm">Tome</span>
+              </div>
+              <button
+                onClick={onMobileClose}
+                className="flex items-center justify-center w-8 h-8 text-muted-foreground hover:text-foreground transition-colors rounded-lg hover:bg-muted"
+                aria-label={t`Close navigation`}
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <nav className="flex-1 overflow-y-auto px-2 py-4 space-y-4 overscroll-contain">
+              <div>
+                <button
+                  onClick={() => { onOpenHomeView(); onMobileClose() }}
+                  className={cn(
+                    'group flex items-center gap-2 w-full px-2 py-2.5 rounded-lg text-sm transition-all touch-feedback',
+                    isHomeTab
+                      ? 'bg-primary/10 text-primary font-medium'
+                      : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                  )}
+                >
+                  <Home className="w-5 h-5 shrink-0 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+                  <span className="truncate"><Trans>Home</Trans></span>
+                </button>
+                <button
+                  onClick={() => { selectAllBooks(); onMobileClose() }}
+                  className={cn(
+                    'group flex items-center gap-2 w-full px-2 py-2.5 rounded-lg text-sm transition-all touch-feedback',
+                    isAllBooks
+                      ? 'bg-primary/10 text-primary font-medium'
+                      : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                  )}
+                >
+                  <BookOpen className="w-5 h-5 shrink-0 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+                  <span className="truncate"><Trans>All Books</Trans></span>
+                </button>
+                <button
+                  onClick={() => { onOpenSeriesView(); onMobileClose() }}
+                  className={cn(
+                    'group flex items-center gap-2 w-full px-2 py-2.5 rounded-lg text-sm transition-all touch-feedback',
+                    isSeriesTab
+                      ? 'bg-primary/10 text-primary font-medium'
+                      : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                  )}
+                >
+                  <Layers className="w-5 h-5 shrink-0 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+                  <span className="truncate"><Trans>Series</Trans></span>
+                </button>
+                <Link
+                  to="/stats"
+                  onClick={onMobileClose}
+                  className={cn(
+                    'group flex items-center gap-2 w-full px-2 py-2.5 rounded-lg text-sm transition-all touch-feedback',
+                    location.pathname === '/stats'
+                      ? 'bg-primary/10 text-primary font-medium'
+                      : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                  )}
+                >
+                  <BarChart3 className="w-5 h-5 shrink-0 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+                  <span className="truncate"><Trans>Stats</Trans></span>
+                </Link>
+                <Link
+                  to="/highlights"
+                  onClick={onMobileClose}
+                  className={cn(
+                    'group flex items-center gap-2 w-full px-2 py-2.5 rounded-lg text-sm transition-all touch-feedback',
+                    location.pathname === '/highlights'
+                      ? 'bg-primary/10 text-primary font-medium'
+                      : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                  )}
+                >
+                  <Quote className="w-5 h-5 shrink-0 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+                  <span className="truncate"><Trans>Highlights</Trans></span>
+                </Link>
+                {isMember(user) && (
+                  <Link
+                    to="/wishlist"
+                    onClick={onMobileClose}
+                    className={cn(
+                      'group flex items-center gap-2 w-full px-2 py-2.5 rounded-lg text-sm transition-all touch-feedback',
+                      location.pathname === '/wishlist'
+                        ? 'bg-primary/10 text-primary font-medium'
+                        : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                    )}
+                  >
+                    <Sparkles className="w-5 h-5 shrink-0 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+                    <span className="truncate"><Trans>Wishlist</Trans></span>
+                  </Link>
+                )}
+                {isAdmin(user) && (
+                  <Link
+                    to="/bindery"
+                    onClick={onMobileClose}
+                    className={cn(
+                      'group flex items-center gap-2 w-full px-2 py-2.5 rounded-lg text-sm transition-all touch-feedback',
+                      location.pathname === '/bindery'
+                        ? 'bg-primary/10 text-primary font-medium'
+                        : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                    )}
+                  >
+                    <BookPlus className="w-5 h-5 shrink-0 group-hover:animate-[wiggle_0.4s_ease-in-out]" />
+                    <span className="truncate flex-1"><Trans>Bindery</Trans></span>
+                    {binderyCount > 0 && (
+                      <span className="text-xs font-medium text-primary tabular-nums">{binderyCount}</span>
+                    )}
+                  </Link>
+                )}
+              </div>
+
+              <Section
+                title={t`Libraries`}
+                icon={<LibraryIcon className="w-3 h-3" />}
+                onAdd={openCreateLibModal} addLabel={t`New library`}
+              >
+                {libraries.map(lib => (
+                  <SidebarItem
+                    key={lib.id}
+                    label={lib.name}
+                    iconName={lib.icon ?? 'Library'}
+                    count={lib.book_count}
+                    active={activeLibrary === lib.id}
+                    isPrivate={lib.is_public === false}
+                    onClick={() => selectLibrary(lib.id)}
+                    onEdit={lib.can_edit ? () => openEditLibModal(lib) : undefined}
+                    onDelete={lib.can_edit ? async () => {
+                      await api.delete(`/libraries/${lib.id}`)
+                      if (activeLibrary === lib.id) selectAllBooks()
+                      onLibrariesChange()
+                    } : undefined}
+                  />
+                ))}
+              </Section>
+
+              {savedFilters.length > 0 && (
+                <Section
+                  title={t`Shelves`}
+                  icon={<Bookmark className="w-3 h-3" />}
+                >
+                  {savedFilters.map(sf => (
+                    <SidebarItem
+                      key={sf.id}
+                      label={sf.name}
+                      iconName={sf.icon ?? 'Bookmark'}
+                      active={activeSavedFilter === sf.id}
+                      onClick={() => selectSavedFilter(sf)}
+                      onEdit={() => openEditFilterModal(sf)}
+                      onShare={() => setShareShelf(sf)}
+                      onDelete={async () => {
+                        await api.delete(`/saved-filters/${sf.id}`)
+                        if (activeSavedFilter === sf.id) selectAllBooks()
+                        onSavedFiltersChange()
+                      }}
+                    />
+                  ))}
+                </Section>
+              )}
+            </nav>
+
+            {/* Mobile user footer */}
+            <div className="shrink-0 border-t border-border">
+              {/* User info */}
+              <div className="flex items-center gap-3 px-4 py-3">
+                <div className="flex w-9 h-9 items-center justify-center rounded-full bg-primary/10 text-xs font-bold text-primary shrink-0 ring-2 ring-primary/20">
+                  {(user?.username ?? '?').slice(0, 2).toUpperCase()}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium truncate">{user?.username}</p>
+                  {isAdmin(user) && <p className="text-[11px] text-muted-foreground"><Trans>Admin</Trans></p>}
+                </div>
+              </div>
+              {/* Actions */}
+              <div className="px-2 pb-3 space-y-0.5">
+                <MobileThemeRow />
+                <Link
+                  to="/settings"
+                  onClick={onMobileClose}
+                  className="flex items-center gap-3 w-full px-3 py-2.5 rounded-lg text-sm text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                >
+                  <Settings className="w-5 h-5 shrink-0" />
+                  <Trans>Settings</Trans>
+                </Link>
+                {isAdmin(user) && (
+                  <Link
+                    to="/admin"
+                    onClick={onMobileClose}
+                    className="flex items-center gap-3 w-full px-3 py-2.5 rounded-lg text-sm text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                  >
+                    <Shield className="w-5 h-5 shrink-0" />
+                    <Trans>Admin</Trans>
+                  </Link>
+                )}
+                <a
+                  href={docsLink(DOCS.home)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={onMobileClose}
+                  className="flex items-center gap-3 w-full px-3 py-2.5 rounded-lg text-sm text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                >
+                  <BookOpen className="w-5 h-5 shrink-0" />
+                  <span className="flex-1"><Trans>Docs</Trans></span>
+                  <ExternalLink className="w-3.5 h-3.5 shrink-0 opacity-60" />
+                </a>
+                <button
+                  onClick={() => { logout(); onMobileClose() }}
+                  className="flex items-center gap-3 w-full px-3 py-2.5 rounded-lg text-sm text-destructive/80 hover:text-destructive hover:bg-destructive/10 transition-colors"
+                >
+                  <LogOut className="w-5 h-5 shrink-0" />
+                  <Trans>Log out</Trans>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+    </>
+  )
+}
+
+
+const THEME_OPTIONS: { id: ThemeId; icon: typeof Sun; label: MessageDescriptor }[] = [
+  { id: 'light', icon: Sun, label: msg`Light` },
+  { id: 'dark', icon: Moon, label: msg`Dark` },
+  { id: 'black', icon: MoonStar, label: msg`Black` },
+  { id: 'amber', icon: Flame, label: msg`Amber` },
+  { id: 'ember', icon: Coffee, label: msg`Ember` },
+]
+
+function ThemeMenuItems({ itemClass }: { itemClass: string }) {
+  const { i18n } = useLingui()
+  const [current, setCurrent] = useState(getStoredTheme)
+  return (
+    <>
+      {THEME_OPTIONS.map(({ id, icon: Icon, label }) => (
+        <Fragment key={id}>
+          {/* hairline between the neutral core and the warm pair */}
+          {id === 'amber' && <div className="h-px bg-border my-1" />}
+          <button
+            onClick={() => { applyTheme(id); setCurrent(id) }}
+            className={itemClass}
+          >
+            <Icon className="w-4 h-4 shrink-0" />
+            {i18n._(label)}
+            {current === id && <Check className="w-3.5 h-3.5 shrink-0 text-primary ml-auto" />}
+          </button>
+        </Fragment>
+      ))}
+    </>
+  )
+}
+
+function MobileThemeRow() {
+  const { t, i18n } = useLingui()
+  const [current, setCurrent] = useState(getStoredTheme)
+  return (
+    <div className="flex items-center gap-1 px-3 py-1.5">
+      <span className="flex-1 text-sm text-muted-foreground"><Trans>Theme</Trans></span>
+      {THEME_OPTIONS.map(({ id, icon: Icon, label }) => {
+        const themeName = i18n._(label)
+        return (
+        <button
+          key={id}
+          onClick={() => { applyTheme(id); setCurrent(id) }}
+          title={themeName}
+          aria-label={t`${themeName} theme`}
+          className={cn(
+            'flex items-center justify-center w-9 h-9 rounded-lg transition-colors',
+            current === id
+              ? 'bg-primary/10 text-primary'
+              : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+          )}
+        >
+          <Icon className="w-4 h-4" />
+        </button>
+        )
+      })}
+    </div>
+  )
+}
+
+function CollapsedUserMenu({ user, logout, onExpand }: { user: { username: string; is_admin?: boolean; role?: string } | null; logout: () => void; onExpand: () => void }) {
+  const { t } = useLingui()
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    function handler(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  const menuItem = 'flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] rounded-md transition-colors hover:bg-accent text-foreground/80 hover:text-foreground'
+  const destructive = menuItem + ' text-destructive/80 hover:text-destructive hover:bg-destructive/10'
+
+  return (
+    <div ref={ref} className="relative shrink-0 border-t border-border flex flex-col items-center gap-0.5 py-2">
+      <button
+        onClick={onExpand}
+        title={t`Expand sidebar`}
+        aria-label={t`Expand sidebar`}
+        className="flex items-center justify-center w-9 h-7 rounded-lg text-muted-foreground/60 hover:text-foreground hover:bg-accent/60 transition-colors"
+      >
+        <ChevronRight className="w-4 h-4" />
+      </button>
+      <button
+        onClick={() => setOpen(o => !o)}
+        title={user?.username ?? t`User menu`}
+        aria-label={user?.username ?? t`User menu`}
+        className="flex items-center justify-center w-9 h-9 rounded-lg hover:bg-accent/60 transition-colors"
+      >
+        <div className="flex w-6 h-6 items-center justify-center rounded-full bg-primary/10 text-[10px] font-bold text-primary ring-2 ring-primary/20">
+          {(user?.username ?? '?').slice(0, 2).toUpperCase()}
+        </div>
+      </button>
+      {open && (
+        <div className="absolute bottom-full left-1 right-1 mb-1 bg-card border border-border rounded-xl shadow-lg shadow-accent-soft py-1.5 z-50 w-40">
+          <Link to="/settings" onClick={() => setOpen(false)} className={menuItem}>
+            <Settings className="w-4 h-4 shrink-0" />
+            <Trans>Settings</Trans>
+          </Link>
+          {(user?.is_admin || user?.role === 'admin') && (
+            <Link to="/admin" onClick={() => setOpen(false)} className={menuItem}>
+              <Shield className="w-4 h-4 shrink-0" />
+              <Trans>Admin</Trans>
+            </Link>
+          )}
+          <a href={docsLink(DOCS.home)} target="_blank" rel="noopener noreferrer" onClick={() => setOpen(false)} className={menuItem}>
+            <BookOpen className="w-4 h-4 shrink-0" />
+            <span className="flex-1"><Trans>Docs</Trans></span>
+            <ExternalLink className="w-3 h-3 shrink-0 opacity-60" />
+          </a>
+          <div className="my-1 h-px bg-border mx-2" />
+          <ThemeMenuItems itemClass={menuItem} />
+          <div className="my-1 h-px bg-border mx-2" />
+          <button onClick={logout} className={destructive}>
+            <LogOut className="w-4 h-4 shrink-0" />
+            <Trans>Log out</Trans>
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function UserMenu({ user, logout, onCollapse }: { user: { username: string; is_admin?: boolean; role?: string } | null; logout: () => void; onCollapse: () => void }) {
+  const { t } = useLingui()
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    function handler(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  const menuItem = 'flex items-center gap-2.5 w-full px-3 py-1.5 text-[13px] rounded-md transition-colors hover:bg-accent text-foreground/80 hover:text-foreground'
+  const destructive = menuItem + ' text-destructive/80 hover:text-destructive hover:bg-destructive/10'
+
+  return (
+    <div ref={ref} className="relative shrink-0 border-t border-border px-2 py-2.5 flex items-center gap-0.5">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="flex items-center gap-2 flex-1 min-w-0 px-2 py-1.5 rounded-lg text-[13px] hover:bg-accent/60 transition-colors"
+      >
+        <div className="flex w-6 h-6 items-center justify-center rounded-full bg-primary/10 text-[10px] font-bold text-primary shrink-0 ring-2 ring-primary/20">
+          {(user?.username ?? '?').slice(0, 2).toUpperCase()}
+        </div>
+        <span className="truncate font-medium text-foreground/80 flex-1 text-left">{user?.username}</span>
+        <ChevronsUpDown className="w-3 h-3 text-muted-foreground/50 shrink-0" />
+      </button>
+      <button
+        onClick={onCollapse}
+        title={t`Collapse sidebar`}
+        aria-label={t`Collapse sidebar`}
+        className="flex items-center justify-center w-7 h-8 rounded-lg shrink-0 text-muted-foreground/60 hover:text-foreground hover:bg-accent/60 transition-colors"
+      >
+        <ChevronLeft className="w-4 h-4" />
+      </button>
+
+      {open && (
+        <div className="absolute bottom-full left-2 right-2 mb-1 bg-card border border-border rounded-xl shadow-lg shadow-accent-soft py-1.5 z-50">
+          <Link to="/settings" onClick={() => setOpen(false)} className={menuItem}>
+            <Settings className="w-4 h-4 shrink-0" />
+            <Trans>Settings</Trans>
+          </Link>
+          {(user?.is_admin || user?.role === 'admin') && (
+            <Link to="/admin" onClick={() => setOpen(false)} className={menuItem}>
+              <Shield className="w-4 h-4 shrink-0" />
+              <Trans>Admin</Trans>
+            </Link>
+          )}
+          <a href={docsLink(DOCS.home)} target="_blank" rel="noopener noreferrer" onClick={() => setOpen(false)} className={menuItem}>
+            <BookOpen className="w-4 h-4 shrink-0" />
+            <span className="flex-1"><Trans>Docs</Trans></span>
+            <ExternalLink className="w-3 h-3 shrink-0 opacity-60" />
+          </a>
+          <div className="my-1 h-px bg-border mx-2" />
+          <ThemeMenuItems itemClass={menuItem} />
+          <div className="my-1 h-px bg-border mx-2" />
+          <button onClick={logout} className={destructive}>
+            <LogOut className="w-4 h-4 shrink-0" />
+            <Trans>Log out</Trans>
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function Section({ title, icon, onAdd, addLabel, onTitleClick, children }: {
+  title: string
+  icon: React.ReactNode
+  onAdd?: () => void
+  /** Accessible label for the add button, e.g. "New library". */
+  addLabel?: string
+  onTitleClick?: () => void
+  children: React.ReactNode
+}) {
+  return (
+    <div>
+      <div className="flex items-center justify-between px-2 mb-1">
+        <button
+          onClick={onTitleClick}
+          className={cn(
+            'flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground transition-colors',
+            onTitleClick && 'hover:text-foreground cursor-pointer'
+          )}
+        >
+          {icon} {title}
+        </button>
+        {onAdd && (
+          <button
+            onClick={onAdd}
+            className="p-2.5 -m-2 text-muted-foreground hover:text-foreground transition-colors"
+            title={addLabel}
+            aria-label={addLabel}
+          >
+            <Plus className="w-3.5 h-3.5" />
+          </button>
+        )}
+      </div>
+      <div className="space-y-0.5">{children}</div>
+    </div>
+  )
+}
+
+function SidebarItem({ label, iconName, count, active, isPrivate, onClick, onEdit, onShare, onDelete }: {
+  label: string
+  iconName: string
+  count?: number
+  active: boolean
+  isPrivate?: boolean
+  onClick: () => void
+  onEdit?: () => void
+  onShare?: () => void
+  onDelete?: () => Promise<void>
+}) {
+  const { t } = useLingui()
+  return (
+    <div
+      className={cn(
+        'group flex items-center gap-2 w-full px-2 py-1.5 rounded-lg text-sm transition-all cursor-pointer',
+        active
+          ? 'bg-primary/10 text-primary font-medium'
+          : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+      )}
+      onClick={onClick}
+    >
+      <span className="shrink-0 sidebar-item-icon">{getIcon(iconName)}</span>
+      <span className="truncate flex-1">{label}</span>
+      {isPrivate && (
+        <span title={t`Private library`} className="shrink-0 flex items-center group-hover:hidden group-focus-within:hidden">
+          <Lock className="w-3 h-3 text-muted-foreground/50" />
+        </span>
+      )}
+      {/* A ghost "0" on an empty library was pure noise — no count reads cleaner. */}
+      {count != null && count > 0 && !isPrivate && (
+        <span className="text-[10px] shrink-0 text-muted-foreground group-hover:hidden group-focus-within:hidden">
+          {count}
+        </span>
+      )}
+      <div className="hidden group-hover:flex group-focus-within:flex items-center gap-0.5 shrink-0">
+        {onEdit && (
+          <button
+            onClick={e => { e.stopPropagation(); onEdit() }}
+            className="p-0.5 rounded hover:text-foreground transition-colors"
+            title={t`Edit`}
+            aria-label={t`Edit`}
+          >
+            <Pencil className="w-3 h-3" />
+          </button>
+        )}
+        {onShare && (
+          <button
+            onClick={e => { e.stopPropagation(); onShare() }}
+            className="p-0.5 rounded hover:text-foreground transition-colors"
+            title={t`Share`}
+            aria-label={t`Share`}
+          >
+            <Share2 className="w-3 h-3" />
+          </button>
+        )}
+        {onDelete && (
+          <button
+            onClick={async e => { e.stopPropagation(); await onDelete() }}
+            className="p-0.5 rounded hover:text-destructive transition-colors"
+            title={t`Delete`}
+            aria-label={t`Delete`}
+          >
+            <Trash2 className="w-3 h-3" />
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+type ShareUser = { id: number; username: string; role: string }
+
+function LibraryModal({ title, initialName, initialIcon, initialIsPublic, libraryId, initialAssignedIds, currentUserId, onSave, onChanged, onClose }: {
+  title: string
+  initialName?: string
+  initialIcon?: string
+  initialIsPublic?: boolean
+  libraryId?: number | null
+  initialAssignedIds?: number[]
+  currentUserId?: number | null
+  onSave: (name: string, icon: string, isPublic: boolean) => Promise<void>
+  onChanged?: () => void
+  onClose: () => void
+}) {
+  const { t } = useLingui()
+  const [name, setName] = useState(initialName ?? '')
+  const [icon, setIcon] = useState(initialIcon ?? 'Library')
+  const [isPublic, setIsPublic] = useState(initialIsPublic ?? true)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  // Share-with-users state (only meaningful when editing an existing, private library)
+  const [users, setUsers] = useState<ShareUser[]>([])
+  const [assignedIds, setAssignedIds] = useState<Set<number>>(new Set(initialAssignedIds ?? []))
+  const [busyUserId, setBusyUserId] = useState<number | null>(null)
+  const canShare = libraryId != null && !isPublic
+
+  useEffect(() => {
+    if (libraryId == null) return
+    api.get<ShareUser[]>('/users/list')
+      .then(list => setUsers(list.filter(u => u.id !== currentUserId)))
+      .catch(() => {})
+  }, [libraryId, currentUserId])
+
+  async function toggleUser(userId: number) {
+    if (libraryId == null || busyUserId != null) return
+    setBusyUserId(userId)
+    const isAssigned = assignedIds.has(userId)
+    try {
+      if (isAssigned) {
+        await api.delete(`/libraries/${libraryId}/users/${userId}`)
+        setAssignedIds(prev => { const next = new Set(prev); next.delete(userId); return next })
+      } else {
+        await api.post(`/libraries/${libraryId}/users`, { user_id: userId })
+        setAssignedIds(prev => new Set(prev).add(userId))
+      }
+      onChanged?.()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : t`Failed to update sharing`)
+    } finally {
+      setBusyUserId(null)
+    }
+  }
+
+  useEffect(() => { inputRef.current?.focus() }, [])
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) { if (e.key === 'Escape') onClose() }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  async function handleSave() {
+    if (!name.trim() || saving) return
+    setSaving(true)
+    setError('')
+    try {
+      await onSave(name.trim(), icon, isPublic)
+      onClose()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : t`Failed to save`)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center"
+      onMouseDown={e => { if (e.target === e.currentTarget) onClose() }}
+    >
+      <div className="bg-card text-foreground rounded-2xl shadow-xl shadow-accent-soft max-w-sm w-full mx-4 p-6 space-y-4">
+        <h2 className="text-base font-semibold">{title}</h2>
+        <input
+          ref={inputRef}
+          value={name}
+          onChange={e => { setName(e.target.value); setError('') }}
+          onKeyDown={e => { if (e.key === 'Enter') handleSave() }}
+          placeholder={t`Name…`}
+          className="w-full px-3 py-2 rounded-lg border border-border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+        />
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-muted-foreground"><Trans>Icon</Trans></span>
+          <IconPicker value={icon} onChange={setIcon} />
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-muted-foreground flex-1"><Trans>Public library</Trans></span>
+          <button
+            type="button"
+            onClick={() => setIsPublic(v => !v)}
+            className={cn(
+              'relative w-10 h-6 rounded-full transition-colors flex-shrink-0',
+              isPublic ? 'bg-primary' : 'bg-muted-foreground/30'
+            )}
+          >
+            <span className={cn(
+              'absolute top-1 left-1 w-4 h-4 rounded-full bg-white shadow transition-transform',
+              isPublic ? 'translate-x-4' : 'translate-x-0'
+            )} />
+          </button>
+        </div>
+        {!isPublic && (
+          <p className="text-xs text-muted-foreground flex items-center gap-1">
+            <Lock className="w-3 h-3" /> <Trans>Private — only assigned users can access</Trans>
+          </p>
+        )}
+        {canShare && (
+          <div className="space-y-2">
+            <div className="flex items-center gap-1.5 text-sm text-muted-foreground">
+              <Users className="w-3.5 h-3.5" /> <Trans>Share with users</Trans>
+            </div>
+            {users.length === 0 ? (
+              <p className="text-xs text-muted-foreground"><Trans>No other users to share with.</Trans></p>
+            ) : (
+              <div className="max-h-40 overflow-y-auto rounded-lg border border-border divide-y divide-border">
+                {users.map(u => {
+                  const assigned = assignedIds.has(u.id)
+                  return (
+                    <button
+                      key={u.id}
+                      type="button"
+                      onClick={() => toggleUser(u.id)}
+                      disabled={busyUserId === u.id}
+                      className="w-full flex items-center justify-between px-3 py-2 text-sm hover:bg-muted transition-colors disabled:opacity-50"
+                    >
+                      <span className="truncate">{u.username}</span>
+                      <span className={cn(
+                        'flex items-center justify-center w-5 h-5 rounded border flex-shrink-0',
+                        assigned ? 'bg-primary border-primary text-primary-foreground' : 'border-border'
+                      )}>
+                        {assigned && <Check className="w-3.5 h-3.5" />}
+                      </span>
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
+        {!isPublic && libraryId == null && (
+          <p className="text-xs text-muted-foreground"><Trans>Save the library first, then reopen it to share with users.</Trans></p>
+        )}
+        {error && <p className="text-xs text-destructive">{error}</p>}
+        <div className="flex items-center justify-end gap-2 pt-1">
+          <button
+            onClick={onClose}
+            className="px-3 py-1.5 rounded-lg text-sm text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+          >
+            <Trans>Cancel</Trans>
+          </button>
+          <button
+            onClick={handleSave}
+            disabled={saving || !name.trim()}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50 transition-all"
+          >
+            <Trans>Save</Trans>
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
