@@ -14,6 +14,9 @@ export default defineConfig({
   },
   nitro: false,
   tanstackStart: {
+    // src/routes/tome-main es otro proyecto, no rutas de esta app: el generador
+    // de rutas falla al intentar leerlo ("Crawling result not available").
+    router: { routeFileIgnorePattern: "^tome-main$" },
     // Render como SPA estático: genera un único index.html (más assets JS/CSS)
     // que puede subirse a cualquier hosting estático (Netlify, Vercel static,
     // GitHub Pages, Apache, Nginx, S3, etc.). Las rutas dinámicas con $param

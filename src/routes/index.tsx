@@ -17,16 +17,31 @@ export const Route = createFileRoute("/")({
   component: LoginPage,
 });
 
+// ponytail: credenciales fijas del prototipo; reemplazar por autenticación real.
+const DEFAULT_USER = "bim";
+const DEFAULT_PASS = "bim2026*";
+
 function LoginPage() {
   const navigate = useNavigate();
-  const [user, setUser] = useState("");
-  const [pass, setPass] = useState("");
+  const [user, setUser] = useState(DEFAULT_USER);
+  const [pass, setPass] = useState(DEFAULT_PASS);
   const [show, setShow] = useState(false);
   const [remember, setRemember] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (user.trim().toLowerCase() !== DEFAULT_USER || pass !== DEFAULT_PASS) {
+      setError("Usuario o contraseña incorrectos.");
+      return;
+    }
+    setError("");
+    try {
+      localStorage.setItem("mtc-session", user.trim());
+    } catch {
+      // Sin almacenamiento disponible el ingreso continúa igual.
+    }
     setLoading(true);
     setTimeout(() => navigate({ to: "/verificar" }), 600);
   };
@@ -77,6 +92,15 @@ function LoginPage() {
                 {show ? <EyeOff size={16} /> : <Eye size={16} />}
               </button>
             </div>
+
+            {error && (
+              <p
+                role="alert"
+                className="rounded-md bg-[#fef2f2] px-3 py-2 text-[12px] text-[#b91c1c]"
+              >
+                {error}
+              </p>
+            )}
 
             <div className="flex items-center justify-between text-[12px]">
               <label className="flex items-center gap-2 text-[#374151] cursor-pointer">

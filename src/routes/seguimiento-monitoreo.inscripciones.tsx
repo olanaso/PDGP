@@ -1,5 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { ChevronDown, Eraser, Layers, MapPinned, Plus } from "lucide-react";
+import { useState } from "react";
 import { AppSidebar } from "../components/AppSidebar";
 import { ChartExplanation } from "../components/ChartExplanation";
 
@@ -134,22 +135,64 @@ const resumen = [
   ["Entrega a la oficina patrimonial", "21", "49", "154", "96", "4", "324"],
 ];
 
+const years = ["2021", "2022", "2023", "2024", "2025"];
+const DEFAULT_YEAR = "2025";
+const ALL = "Todas";
+
+// Columna de `rows` que alimenta cada filtro. Los que no tienen columna solo
+// guardan la selección (no hay dato en la tabla con el que cruzarlos).
+const filterColumn: Record<string, number> = {
+  "Expediente físico recibido": 5,
+  "Entrega a la oficina patrimonial (OPAT)": 7,
+  "Estado del título registral": 4,
+  "Estado de inscripción": 4,
+  "Modalidad de adquisición": 2,
+  "Estado de recepción documental": 6,
+};
+
+const initialFilters: Record<string, string> = Object.fromEntries(
+  topFilters.map((filter) => [filter, ALL]),
+);
+
+function filterOptions(filter: string) {
+  const column = filterColumn[filter];
+  return column === undefined ? ["Sí", "No"] : Array.from(new Set(rows.map((row) => row[column])));
+}
+
 function TableroInscripcionesPage() {
+  const [filters, setFilters] = useState(initialFilters);
+  const [year, setYear] = useState(DEFAULT_YEAR);
+
+  const filteredRows = rows.filter((row) =>
+    topFilters.every((filter) => {
+      const column = filterColumn[filter];
+      return filters[filter] === ALL || column === undefined || row[column] === filters[filter];
+    }),
+  );
+
+  const reset = () => {
+    setFilters(initialFilters);
+    setYear(DEFAULT_YEAR);
+  };
+
   return (
     <div className="flex min-h-screen bg-[#f3f4f6]">
       <AppSidebar />
       <main className="min-w-0 flex-1 overflow-auto p-2">
         <div className="min-h-[calc(100vh-16px)]">
           <section className="min-w-0 rounded-md bg-white shadow-sm">
-            <Header />
-            <FilterBand />
+            <Header onReset={reset} />
+            <FilterBand
+              values={filters}
+              onChange={(filter, value) => setFilters({ ...filters, [filter]: value })}
+            />
             <div className="grid grid-cols-[minmax(0,1fr)_360px] gap-2 p-2">
               <div className="min-w-0">
-                <YearBand />
+                <YearBand year={year} onChange={setYear} />
                 <MapPanel />
-                <DetailTable />
+                <DetailTable rows={filteredRows} />
               </div>
-              <RightPanel />
+              <RightPanel year={year} />
             </div>
           </section>
         </div>
@@ -158,7 +201,7 @@ function TableroInscripcionesPage() {
   );
 }
 
-function Header() {
+function Header({ onReset }: { onReset: () => void }) {
   return (
     <header className="grid grid-cols-[minmax(340px,1fr)_280px_145px_105px] items-center gap-3 border-b px-4 py-3 text-[11px]">
       <div>
@@ -175,7 +218,11 @@ function Header() {
       </div>
       <Info label="Proyecto seleccionado" value="Aeropuerto Internacional de Jauja" />
       <Info label="Periodo analizado" value="Octubre de 2025" />
-      <button className="flex h-9 items-center justify-center gap-2 rounded border border-[#d71919] text-[11px] font-bold text-[#d71919]">
+      <button
+        type="button"
+        onClick={onReset}
+        className="flex h-9 items-center justify-center gap-2 rounded border border-[#d71919] text-[11px] font-bold text-[#d71919] hover:bg-red-50"
+      >
         <Eraser size={15} /> Restablecer
       </button>
     </header>
@@ -191,14 +238,35 @@ function Info({ label, value }: { label: string; value: string }) {
   );
 }
 
-function FilterBand() {
+function FilterBand({
+  values,
+  onChange,
+}: {
+  values: Record<string, string>;
+  onChange: (filter: string, value: string) => void;
+}) {
   return (
     <div className="monitor-filter-band grid grid-cols-8 gap-1 bg-[#b7070b] px-2 py-1">
       {topFilters.map((filter) => (
         <label key={filter} className="min-w-0 text-white">
           <span className="block truncate text-[9px] font-bold">{filter}</span>
-          <span className="mt-1 flex h-7 items-center justify-between rounded-sm bg-white px-2 text-[10px] font-medium text-gray-700">
-            Todas <ChevronDown size={12} />
+          <span className="relative mt-1 block">
+            <select
+              value={values[filter]}
+              onChange={(event) => onChange(filter, event.target.value)}
+              className="h-7 w-full appearance-none rounded-sm bg-white pl-2 pr-6 text-[10px] font-medium text-gray-700 outline-none"
+            >
+              <option value={ALL}>{ALL}</option>
+              {filterOptions(filter).map((option) => (
+                <option key={option} value={option}>
+                  {readableTableValue(option, filterColumn[filter] ?? -1)}
+                </option>
+              ))}
+            </select>
+            <ChevronDown
+              size={12}
+              className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-gray-700"
+            />
           </span>
         </label>
       ))}
@@ -206,18 +274,21 @@ function FilterBand() {
   );
 }
 
-function YearBand() {
+function YearBand({ year, onChange }: { year: string; onChange: (year: string) => void }) {
   return (
     <div className="mb-2 grid grid-cols-[150px_repeat(5,1fr)] gap-1">
-      <button className="rounded bg-white px-3 py-2 text-left text-[11px] font-semibold shadow-sm">
+      <div className="rounded bg-white px-3 py-2 text-left text-[11px] font-semibold shadow-sm">
         Año de presentación
-      </button>
-      {["2021", "2022", "2023", "2024", "2025"].map((year) => (
+      </div>
+      {years.map((option) => (
         <button
-          key={year}
-          className={`rounded px-3 py-2 text-[11px] font-bold shadow-sm ${year === "2025" ? "bg-[#b7070b] text-white" : "bg-white text-gray-700"}`}
+          key={option}
+          type="button"
+          onClick={() => onChange(option)}
+          aria-pressed={option === year}
+          className={`rounded px-3 py-2 text-[11px] font-bold shadow-sm ${option === year ? "bg-[#b7070b] text-white" : "bg-white text-gray-700 hover:bg-red-50"}`}
         >
-          {year}
+          {option}
         </button>
       ))}
     </div>
@@ -306,7 +377,7 @@ function Legend({ color, label }: { color: string; label: string }) {
   );
 }
 
-function DetailTable() {
+function DetailTable({ rows }: { rows: string[][] }) {
   return (
     <div className="mt-2 overflow-hidden rounded-md border bg-white shadow-sm">
       <div className="bg-[#b7070b] py-1 text-center text-[10px] font-bold text-white">
@@ -348,11 +419,18 @@ function DetailTable() {
                 ))}
               </tr>
             ))}
+            {rows.length === 0 && (
+              <tr className="border-t">
+                <td colSpan={8} className="px-2 py-4 text-center text-[10px] text-gray-500">
+                  Ningún predio coincide con los filtros seleccionados.
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
       <div className="flex items-center justify-between border-t px-3 py-2 text-[10px] text-gray-500">
-        <span>Mostrando 1 a 8 de 496 registros</span>
+        <span>Mostrando {rows.length} de 496 registros</span>
         <span className="flex items-center gap-2">
           ‹ <b className="rounded bg-[#b7070b] px-2 py-1 text-white">1</b> 2 3 ... 63 ›{" "}
           <select className="rounded border px-2 py-1">
@@ -366,6 +444,7 @@ function DetailTable() {
 
 function readableTableValue(value: string, columnIndex: number) {
   if (columnIndex === 3 && value === "ESTADO") return "Estado peruano";
+  if (value === "En tramite") return "En trámite";
   if (columnIndex !== 2) return value;
   const modalities: Record<string, string> = {
     "TRANSFERENCIA INTERESTATAL": "Transferencia de predio estatal",
@@ -396,7 +475,7 @@ function StatusBadge({ value }: { value: string }) {
   );
 }
 
-function RightPanel() {
+function RightPanel({ year }: { year: string }) {
   return (
     <aside className="space-y-2">
       <div className="grid grid-cols-4 gap-2">
@@ -415,7 +494,7 @@ function RightPanel() {
         total="496"
       />
       <div className="monitor-advanced-section">
-        <ActivityTable />
+        <ActivityTable year={year} />
       </div>
       <div className="text-right text-[9px] text-gray-500">* Cifras actualizadas al 17/10/2025</div>
     </aside>
@@ -473,7 +552,9 @@ function SummaryCard({ title, rows, total }: { title: string; rows: string[][]; 
   );
 }
 
-function ActivityTable() {
+function ActivityTable({ year }: { year: string }) {
+  // Columna 0 = actividad, 1..5 = años, 6 = total.
+  const yearCls = (index: number) => (years[index - 1] === year ? "bg-red-50" : "");
   return (
     <div className="overflow-hidden rounded-md border bg-white shadow-sm">
       <div className="bg-[#b7070b] py-1 text-center text-[10px] font-bold text-white">
@@ -482,8 +563,8 @@ function ActivityTable() {
       <table className="w-full text-[9px]">
         <thead className="bg-gray-50 text-gray-600">
           <tr>
-            {["Actividad", "2021", "2022", "2023", "2024", "2025", "Total"].map((head) => (
-              <th key={head} className="px-1 py-2 text-right first:text-left">
+            {["Actividad", ...years, "Total"].map((head, index) => (
+              <th key={head} className={`px-1 py-2 text-right first:text-left ${yearCls(index)}`}>
                 {head}
               </th>
             ))}
@@ -495,7 +576,7 @@ function ActivityTable() {
               {row.map((cell, index) => (
                 <td
                   key={`${row[0]}-${index}`}
-                  className={`px-1 py-2 ${index > 0 ? "text-right" : ""}`}
+                  className={`px-1 py-2 ${index > 0 ? "text-right" : ""} ${yearCls(index)}`}
                 >
                   {cell}
                 </td>
@@ -504,7 +585,10 @@ function ActivityTable() {
           ))}
           <tr className="border-t font-bold text-[#b7070b]">
             {["TOTAL", "129", "276", "805", "497", "23", "1.730"].map((cell, index) => (
-              <td key={cell} className={`px-1 py-2 ${index > 0 ? "text-right" : ""}`}>
+              <td
+                key={cell}
+                className={`px-1 py-2 ${index > 0 ? "text-right" : ""} ${yearCls(index)}`}
+              >
                 {cell}
               </td>
             ))}

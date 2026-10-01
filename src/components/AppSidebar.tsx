@@ -26,6 +26,7 @@ import {
   Briefcase,
   ReceiptText,
   Landmark,
+  Handshake,
 } from "lucide-react";
 import { useState } from "react";
 
@@ -122,6 +123,9 @@ export function AppSidebar() {
         <div className="px-4 pt-4 pb-1 text-[11px] text-[#6b7280]">Módulos transversales</div>
         <Link to="/interoperabilidad" className={linkCls(path === "/interoperabilidad")}>
           <Network size={15} /> Interoperabilidad
+        </Link>
+        <Link to="/gestion-social" className={linkCls(path === "/gestion-social")}>
+          <Handshake size={15} /> Gestión social
         </Link>
         <Link to="/servicios" className={linkCls(path === "/servicios")}>
           <Briefcase size={15} /> Servicios

@@ -18,6 +18,7 @@ import { Route as RecuperarRouteImport } from './routes/recuperar'
 import { Route as PagoConsignacionRouteImport } from './routes/pago-consignacion'
 import { Route as MapaRouteImport } from './routes/mapa'
 import { Route as InteroperabilidadRouteImport } from './routes/interoperabilidad'
+import { Route as GestionSocialRouteImport } from './routes/gestion-social'
 import { Route as GestionPresupuestalRouteImport } from './routes/gestion-presupuestal'
 import { Route as GestionPredialSocialRouteImport } from './routes/gestion-predial-social'
 import { Route as GestionDocumentalRouteImport } from './routes/gestion-documental'
@@ -146,6 +147,11 @@ const MapaRoute = MapaRouteImport.update({
 const InteroperabilidadRoute = InteroperabilidadRouteImport.update({
   id: '/interoperabilidad',
   path: '/interoperabilidad',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const GestionSocialRoute = GestionSocialRouteImport.update({
+  id: '/gestion-social',
+  path: '/gestion-social',
   getParentRoute: () => rootRouteImport,
 } as any)
 const GestionPresupuestalRoute = GestionPresupuestalRouteImport.update({
@@ -660,6 +666,7 @@ export interface FileRoutesByFullPath {
   '/gestion-documental': typeof GestionDocumentalRoute
   '/gestion-predial-social': typeof GestionPredialSocialRoute
   '/gestion-presupuestal': typeof GestionPresupuestalRoute
+  '/gestion-social': typeof GestionSocialRoute
   '/interoperabilidad': typeof InteroperabilidadRoute
   '/mapa': typeof MapaRoute
   '/pago-consignacion': typeof PagoConsignacionRoute
@@ -755,6 +762,7 @@ export interface FileRoutesByTo {
   '/gestion-documental': typeof GestionDocumentalRoute
   '/gestion-predial-social': typeof GestionPredialSocialRoute
   '/gestion-presupuestal': typeof GestionPresupuestalRoute
+  '/gestion-social': typeof GestionSocialRoute
   '/interoperabilidad': typeof InteroperabilidadRoute
   '/mapa': typeof MapaRoute
   '/pago-consignacion': typeof PagoConsignacionRoute
@@ -848,6 +856,7 @@ export interface FileRoutesById {
   '/gestion-documental': typeof GestionDocumentalRoute
   '/gestion-predial-social': typeof GestionPredialSocialRoute
   '/gestion-presupuestal': typeof GestionPresupuestalRoute
+  '/gestion-social': typeof GestionSocialRoute
   '/interoperabilidad': typeof InteroperabilidadRoute
   '/mapa': typeof MapaRoute
   '/pago-consignacion': typeof PagoConsignacionRoute
@@ -945,6 +954,7 @@ export interface FileRouteTypes {
     | '/gestion-documental'
     | '/gestion-predial-social'
     | '/gestion-presupuestal'
+    | '/gestion-social'
     | '/interoperabilidad'
     | '/mapa'
     | '/pago-consignacion'
@@ -1040,6 +1050,7 @@ export interface FileRouteTypes {
     | '/gestion-documental'
     | '/gestion-predial-social'
     | '/gestion-presupuestal'
+    | '/gestion-social'
     | '/interoperabilidad'
     | '/mapa'
     | '/pago-consignacion'
@@ -1132,6 +1143,7 @@ export interface FileRouteTypes {
     | '/gestion-documental'
     | '/gestion-predial-social'
     | '/gestion-presupuestal'
+    | '/gestion-social'
     | '/interoperabilidad'
     | '/mapa'
     | '/pago-consignacion'
@@ -1228,6 +1240,7 @@ export interface RootRouteChildren {
   GestionDocumentalRoute: typeof GestionDocumentalRoute
   GestionPredialSocialRoute: typeof GestionPredialSocialRoute
   GestionPresupuestalRoute: typeof GestionPresupuestalRoute
+  GestionSocialRoute: typeof GestionSocialRoute
   InteroperabilidadRoute: typeof InteroperabilidadRoute
   MapaRoute: typeof MapaRoute
   PagoConsignacionRoute: typeof PagoConsignacionRoute
@@ -1359,6 +1372,13 @@ declare module '@tanstack/react-router' {
       path: '/interoperabilidad'
       fullPath: '/interoperabilidad'
       preLoaderRoute: typeof InteroperabilidadRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/gestion-social': {
+      id: '/gestion-social'
+      path: '/gestion-social'
+      fullPath: '/gestion-social'
+      preLoaderRoute: typeof GestionSocialRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/gestion-presupuestal': {
@@ -2052,6 +2072,7 @@ const rootRouteChildren: RootRouteChildren = {
   GestionDocumentalRoute: GestionDocumentalRoute,
   GestionPredialSocialRoute: GestionPredialSocialRoute,
   GestionPresupuestalRoute: GestionPresupuestalRoute,
+  GestionSocialRoute: GestionSocialRoute,
   InteroperabilidadRoute: InteroperabilidadRoute,
   MapaRoute: MapaRoute,
   PagoConsignacionRoute: PagoConsignacionRoute,
