@@ -19,12 +19,12 @@ export const Route = createFileRoute("/")({
 
 // ponytail: credenciales fijas del prototipo; reemplazar por autenticación real.
 const DEFAULT_USER = "bim";
-const DEFAULT_PASS = "";
+const DEFAULT_PASS = "Bim2026*";
 
 function LoginPage () {
   const navigate = useNavigate();
-  const [user, setUser] = useState(DEFAULT_USER);
-  const [pass, setPass] = useState(DEFAULT_PASS);
+  const [user, setUser] = useState("");
+  const [pass, setPass] = useState("");
   const [show, setShow] = useState(false);
   const [remember, setRemember] = useState(false);
   const [loading, setLoading] = useState(false);
